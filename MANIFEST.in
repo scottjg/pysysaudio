@@ -1,0 +1,40 @@
+# Include core documentation
+include README.md
+include LICENSE
+include QUICKSTART.md
+include BUILDING.md
+include UV_SETUP.md
+include STATUS.md
+
+# Include feature documentation
+include CALLBACK_FEATURE.md
+include CALLBACK_FORMATS.md
+include PER_APP_CAPTURE.md
+
+# Include examples directory
+recursive-include examples *.py *.md
+
+# Include native source files (important for source distributions!)
+# Note: .mm files need to be included explicitly, not via glob
+include native/audio_recorder.h
+include native/audio_recorder.mm
+include native/bindings.cpp
+
+# Include build/packaging files
+include pyproject.toml
+include setup.py
+include requirements.txt
+include requirements-dev.txt
+
+# Exclude unnecessary files
+global-exclude __pycache__
+global-exclude *.py[co]
+global-exclude *.so
+global-exclude *.dylib
+global-exclude .DS_Store
+global-exclude *.wav
+
+# Exclude test artifacts
+prune tests/__pycache__
+prune .pytest_cache
+

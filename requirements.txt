@@ -1,0 +1,4 @@
+# Build requirements (these are also in pyproject.toml [build-system])
+# Note: These are only needed when building from source, not for using the package
+pybind11>=2.10.0
+

@@ -1,0 +1,8 @@
+# Development requirements
+-r requirements.txt
+pytest>=7.0
+black>=22.0
+mypy>=0.990
+build
+twine
+

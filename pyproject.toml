@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel", "pybind11>=2.10.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pysysaudio"
+version = "0.1.0"
+description = "System audio recording for macOS using ScreenCaptureKit"
+readme = "README.md"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+license = "MIT"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
+]
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "black>=22.0",
+    "mypy>=0.990",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/pysysaudio"
+Repository = "https://github.com/yourusername/pysysaudio"
+
+[tool.setuptools]
+packages = ["pysysaudio"]
+
+[tool.black]
+line-length = 100
+target-version = ['py39']
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.cibuildwheel]
+# Build for Python 3.9 through 3.13
+build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
+# Skip 32-bit builds and all Linux builds (Linux not supported)
+skip = "*-win32 *-manylinux* *-musllinux_*"
+
+# Testing configuration
+test-requires = "pytest"
+test-skip = "*-macosx_*"
+
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "arm64", "universal2"]
+environment = { MACOSX_DEPLOYMENT_TARGET = "13.0" }
+repair-wheel-command = "delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel}"
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]
+test-command = "pytest {project}/tests"
+
