@@ -7,7 +7,6 @@ A Python library for recording system audio on **macOS** and **Windows**.
 - 🎵 Record system audio (all sounds playing on your system)
 - 🪟 **Cross-platform**: macOS (ScreenCaptureKit) and Windows (WASAPI)
 - 🎚️ Configurable sample rate and channel count
-- 📝 Save recordings to WAV format
 - 🔧 Configurable output formats: bytes, NumPy, or MLX arrays
 - 🎛️ Automatic resampling and channel remixing
 

@@ -5,6 +5,7 @@ High-level Python interface for system audio recording.
 import threading
 import struct
 import queue
+from array import array
 from typing import Optional, Iterator, Literal, Union, Any
 from pathlib import Path
 
@@ -188,6 +189,9 @@ class SystemAudioRecorder:
         Returns:
             Resampled/remixed audio as bytes (float32)
         """
+        if self._np is None:
+            return self._resample_and_remix_pure_python(data, sample_count, channels)
+
         # Convert bytes to numpy array for processing
         audio = self._np.frombuffer(data, dtype=self._np.float32).copy()
         frames = sample_count // channels
@@ -236,6 +240,132 @@ class SystemAudioRecorder:
         # Flatten and convert back to bytes
         return audio.flatten().tobytes()
 
+    def _resample_and_remix_pure_python(
+        self, data: bytes, sample_count: int, channels: int
+    ) -> bytes:
+        """
+        Pure Python fallback for resampling/remixing when numpy is unavailable.
+        This is slower than the numpy implementation but avoids the dependency.
+        """
+        samples = array("f")
+        samples.frombytes(data)
+
+        frames = sample_count // channels
+        working_channels = channels
+
+        if working_channels != self.channels and frames > 0:
+            samples = self._remix_channels_pure_python(samples, frames, working_channels)
+            working_channels = self.channels
+            frames = len(samples) // working_channels if working_channels else 0
+
+        if self._actual_sample_rate != self.sample_rate and frames > 0 and working_channels > 0:
+            samples = self._resample_frames_pure_python(
+                samples, frames, working_channels, self._actual_sample_rate, self.sample_rate
+            )
+
+        return samples.tobytes()
+
+    def _remix_channels_pure_python(
+        self, samples: array, frames: int, input_channels: int
+    ) -> array:
+        """Pure Python channel remixing."""
+        target_channels = self.channels
+        remixed = array("f")
+
+        if input_channels == 0 or frames == 0:
+            return remixed
+
+        if target_channels == 1:
+            for frame_idx in range(frames):
+                start = frame_idx * input_channels
+                total = 0.0
+                for ch in range(input_channels):
+                    total += samples[start + ch]
+                remixed.append(total / input_channels)
+            return remixed
+
+        if input_channels == 1:
+            for frame_idx in range(frames):
+                value = samples[frame_idx]
+                for _ in range(target_channels):
+                    remixed.append(value)
+            return remixed
+
+        min_channels = min(input_channels, target_channels)
+        for frame_idx in range(frames):
+            start = frame_idx * input_channels
+            for ch in range(min_channels):
+                remixed.append(samples[start + ch])
+            if target_channels > min_channels:
+                remixed.extend([0.0] * (target_channels - min_channels))
+
+        return remixed
+
+    def _resample_frames_pure_python(
+        self,
+        samples: array,
+        frames: int,
+        channels: int,
+        actual_rate: int,
+        target_rate: int,
+    ) -> array:
+        """Pure Python linear interpolation resampling."""
+        if frames == 0 or channels == 0 or actual_rate == target_rate:
+            return samples
+
+        ratio = target_rate / actual_rate
+        new_frames = int(frames * ratio)
+
+        if new_frames == frames:
+            return samples
+        if new_frames <= 0:
+            return array("f")
+
+        per_channel = []
+        for ch in range(channels):
+            channel_values = [
+                samples[frame_idx * channels + ch] for frame_idx in range(frames)
+            ]
+            per_channel.append(channel_values)
+
+        resampled_channels = [
+            self._linear_resample_channel(channel_values, new_frames)
+            for channel_values in per_channel
+        ]
+
+        interleaved = array("f")
+        for frame_idx in range(new_frames):
+            for ch in range(channels):
+                interleaved.append(resampled_channels[ch][frame_idx])
+
+        return interleaved
+
+    @staticmethod
+    def _linear_resample_channel(channel_values: list[float], new_frames: int) -> list[float]:
+        """Linear interpolation helper for resampling a single channel."""
+        if new_frames <= 0:
+            return []
+
+        frames = len(channel_values)
+        if frames == 0:
+            return [0.0] * new_frames
+        if frames == 1 or new_frames == 1:
+            return [channel_values[0]] * new_frames
+
+        scale = (frames - 1) / (new_frames - 1)
+        result = []
+        for i in range(new_frames):
+            pos = i * scale
+            idx = int(pos)
+            frac = pos - idx
+            if idx >= frames - 1:
+                result.append(channel_values[-1])
+            else:
+                start = channel_values[idx]
+                end = channel_values[idx + 1]
+                result.append(start + (end - start) * frac)
+        return result
+
     def _convert_dtype(self, data: bytes) -> bytes:
         """
         Convert float32 audio data to int16 or int32.
@@ -247,7 +377,7 @@ class SystemAudioRecorder:
             Converted audio data as bytes in the target dtype
         """
         # Use numpy if available (faster), otherwise use struct (no dependencies)
-        if hasattr(self, "_np"):
+        if self._np is not None:
             # Fast numpy path
             audio = self._np.frombuffer(data, dtype=self._np.float32)
             audio = self._np.clip(audio, -1.0, 1.0)
@@ -281,13 +411,18 @@ class SystemAudioRecorder:
 
     def _convert_audio_data(self, data: bytes, sample_count: int, channels: int) -> AudioData:
         """Convert raw bytes to the requested format, with automatic resampling."""
-        # Apply resampling/remixing if needed
-        if self._actual_channels != self.channels or self._actual_sample_rate != self.sample_rate:
-            # Check if numpy is available for resampling
-            if self._np is None:
-                raise ImportError(
-                    "Automatic resampling requires numpy. " "Install with: pip install numpy"
-                )
+        needs_resample = (
+            self._actual_channels != self.channels
+            or self._actual_sample_rate != self.sample_rate
+        )
+
+        if needs_resample and self._np is None and self.format != "bytes":
+            raise ImportError(
+                "Automatic resampling requires numpy. " "Install with: pip install numpy"
+            )
+
+        # Apply resampling/remixing if needed (numpy or pure python path)
+        if needs_resample:
             data = self._resample_and_remix(data, sample_count, channels)
             # After resampling, get actual dimensions from the resampled data
             channels = self.channels

@@ -5,6 +5,7 @@ Tests for pysysaudio recorder functionality
 import pytest
 import tempfile
 import os
+import struct
 from pathlib import Path
 
 
@@ -142,6 +143,43 @@ def test_stream_without_recording():
     # Stream should not yield anything when not recording
     chunks = list(recorder.stream(timeout=0.1))
     assert len(chunks) == 0
+
+
+def test_bytes_resample_without_numpy():
+    """Ensure bytes format can resample even when numpy is unavailable."""
+    from pysysaudio import SystemAudioRecorder
+
+    recorder = SystemAudioRecorder(sample_rate=24000, channels=1, format="bytes", dtype="float32")
+    recorder._np = None  # Simulate numpy not being installed
+    recorder._actual_sample_rate = 48000
+    recorder._actual_channels = 2
+
+    frames = 4
+    input_channels = 2
+    sample_count = frames * input_channels
+    samples = [float(i) for i in range(sample_count)]
+    data = struct.pack(f"<{sample_count}f", *samples)
+
+    result = recorder._convert_audio_data(data, sample_count, input_channels)
+    expected_frames = int(frames * recorder.sample_rate / recorder._actual_sample_rate)
+    assert len(result) == expected_frames * recorder.channels * 4  # float32 bytes
+
+    output_samples = struct.unpack(f"<{expected_frames * recorder.channels}f", result)
+    assert output_samples == pytest.approx((0.5, 6.5))
+
+
+def test_bytes_int16_conversion_without_numpy():
+    """Ensure dtype conversion works without numpy dependency."""
+    from pysysaudio import SystemAudioRecorder
+
+    recorder = SystemAudioRecorder(format="bytes", dtype="int16")
+    recorder._np = None  # Simulate numpy not being installed
+
+    data = struct.pack("<2f", -1.0, 1.0)
+    converted = recorder._convert_dtype(data)
+
+    ints = struct.unpack("<2h", converted)
+    assert ints == (-32767, 32767)
 
 
 if __name__ == "__main__":
