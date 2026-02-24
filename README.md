@@ -13,7 +13,7 @@ A Python library for recording system audio on **macOS** and **Windows**.
 ## Requirements
 
 ### macOS
-- macOS 13.0 (Ventura) or later
+- macOS 14.2 (Ventura) or later
 - Python 3.9+
 - Screen Recording permission (macOS will prompt on first use)
 
@@ -31,7 +31,7 @@ pip install pysysaudio
 ```
 
 Pre-built wheels are available for:
-- **macOS**: 13.0+ (Ventura and later) - Intel, Apple Silicon, and Universal2
+- **macOS**: 14.2+ - Intel, Apple Silicon, and Universal2
 - **Windows**: 10+ (64-bit)
 - **Python**: 3.9, 3.10, 3.11, 3.12, 3.13
 
@@ -221,11 +221,11 @@ Returns `True` if permission is granted, `False` otherwise.
 
 ## Permissions
 
-On first use, macOS will prompt you to grant Screen Recording permission to your application/terminal. This is required for ScreenCaptureKit to capture system audio.
+On first use, macOS will prompt you to grant system audio recording permission to your application/terminal.
 
 To grant permission:
 1. macOS will show a permission dialog on first use
-2. Or manually: System Settings → Privacy & Security → Screen Recording
+2. Or manually: System Settings → Privacy & Security → Screen & System Audio Recording
 3. Enable permission for your Python interpreter or Terminal
 
 ## How It Works
@@ -233,7 +233,7 @@ To grant permission:
 `pysysaudio` uses platform-native APIs for optimal performance:
 
 ### macOS
-Uses ScreenCaptureKit framework to capture system audio. ScreenCaptureKit is a modern API introduced in macOS 12.3, with audio capture support added in macOS 13.0.
+Uses CoreAudio process taps to capture system audio (requires macOS 14.2+).
 
 ### Windows  
 Uses WASAPI (Windows Audio Session API) in loopback mode to capture audio from the default output device.

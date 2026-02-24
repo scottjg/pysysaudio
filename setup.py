@@ -20,9 +20,11 @@ system = platform.system()
 if system == "Darwin":
     # macOS build configuration
     macos_version = platform.mac_ver()[0]
-    major = int(macos_version.split(".")[0])
-    if major < 13:
-        raise RuntimeError("pysysaudio requires macOS 13.0 (Ventura) or later")
+    version_parts = [int(p) for p in macos_version.split(".") if p]
+    while len(version_parts) < 2:
+        version_parts.append(0)
+    if tuple(version_parts[:2]) < (14, 2):
+        raise RuntimeError("pysysaudio requires macOS 14.2 or later")
 
     ext_modules = [
         Extension(
@@ -39,23 +41,17 @@ if system == "Darwin":
             extra_compile_args=[
                 "-std=c++17",
                 "-stdlib=libc++",
-                "-mmacosx-version-min=13.0",
+                "-mmacosx-version-min=14.2",
                 "-fobjc-arc",  # Enable ARC for Objective-C
             ],
             extra_link_args=[
-                "-framework",
-                "ScreenCaptureKit",
-                "-framework",
-                "AVFoundation",
-                "-framework",
-                "CoreMedia",
                 "-framework",
                 "CoreAudio",
                 "-framework",
                 "AudioToolbox",
                 "-framework",
                 "Foundation",
-                "-mmacosx-version-min=13.0",
+                "-mmacosx-version-min=14.2",
             ],
         ),
     ]

@@ -6,7 +6,22 @@ import pytest
 import tempfile
 import os
 import struct
+import platform
+import sys
 from pathlib import Path
+
+
+def _macos_supports_coreaudio_taps() -> bool:
+    """CoreAudio process taps are available on macOS 14.2+."""
+    if sys.platform != "darwin":
+        return False
+    version = platform.mac_ver()[0]
+    if not version:
+        return False
+    parts = [int(p) for p in version.split(".") if p]
+    while len(parts) < 2:
+        parts.append(0)
+    return tuple(parts[:2]) >= (14, 2)
 
 
 def test_import():
@@ -62,8 +77,8 @@ def test_context_manager():
 
 
 @pytest.mark.skipif(
-    not os.path.exists("/System/Library/Frameworks/ScreenCaptureKit.framework"),
-    reason="ScreenCaptureKit not available",
+    not _macos_supports_coreaudio_taps(),
+    reason="CoreAudio process taps require macOS 14.2+",
 )
 def test_recording_lifecycle():
     """Test basic recording start/stop lifecycle"""
@@ -94,8 +109,8 @@ def test_recording_lifecycle():
 
 
 @pytest.mark.skipif(
-    not os.path.exists("/System/Library/Frameworks/ScreenCaptureKit.framework"),
-    reason="ScreenCaptureKit not available",
+    not _macos_supports_coreaudio_taps(),
+    reason="CoreAudio process taps require macOS 14.2+",
 )
 def test_cannot_start_twice():
     """Test that starting recording twice raises an error"""
@@ -121,8 +136,8 @@ def test_cannot_start_twice():
 
 
 @pytest.mark.skipif(
-    not os.path.exists("/System/Library/Frameworks/ScreenCaptureKit.framework"),
-    reason="ScreenCaptureKit not available",
+    not _macos_supports_coreaudio_taps(),
+    reason="CoreAudio process taps require macOS 14.2+",
 )
 def test_cannot_stop_without_start():
     """Test that stopping without starting raises an error"""

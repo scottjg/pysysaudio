@@ -10,7 +10,7 @@ PYBIND11_MODULE(_pysysaudio_native, m) {
 #ifdef _WIN32
     m.doc() = "Native audio recording module using WASAPI (Windows Audio Session API)";
 #else
-    m.doc() = "Native audio recording module using ScreenCaptureKit (macOS)";
+    m.doc() = "Native audio recording module using CoreAudio taps (macOS)";
 #endif
 
     // AudioRecorder class
@@ -45,11 +45,11 @@ PYBIND11_MODULE(_pysysaudio_native, m) {
              "Check if currently recording")
         .def_static("check_screen_recording_permission", 
                     &AudioRecorder::check_screen_recording_permission,
-                    "Check if Screen Recording permission is granted");
+                    "Check if the current macOS runtime supports system capture");
 
     // Standalone function for checking permission
     m.def("check_screen_recording_permission", 
           &AudioRecorder::check_screen_recording_permission,
-          "Check if Screen Recording permission is granted");
+          "Check if the current macOS runtime supports system capture");
 }
 

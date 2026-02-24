@@ -17,8 +17,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        # macOS 13+ required for ScreenCaptureKit
-        os: [macos-13, windows-latest]
+        # macOS 14+ required for CoreAudio process taps
+        os: [macos-14, windows-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -30,9 +30,9 @@ jobs:
           CIBW_BUILD: cp39-* cp310-* cp311-* cp312-* cp313-*
           # Skip 32-bit builds and all Linux builds (Linux not supported)
           CIBW_SKIP: "*-win32 *-manylinux* *-musllinux_*"
-          # macOS: Only build for macOS 13.0+, universal2 and arm64
+          # macOS: Only build for macOS 14.2+, universal2 and arm64
           CIBW_ARCHS_MACOS: "x86_64 arm64 universal2"
-          CIBW_ENVIRONMENT_MACOS: MACOSX_DEPLOYMENT_TARGET=13.0
+          CIBW_ENVIRONMENT_MACOS: MACOSX_DEPLOYMENT_TARGET=14.2
           # Windows: Build for amd64 only
           CIBW_ARCHS_WINDOWS: "AMD64"
           # Install test dependencies
@@ -51,7 +51,7 @@ jobs:
 
   build_sdist:
     name: Build source distribution
-    runs-on: macos-13
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 

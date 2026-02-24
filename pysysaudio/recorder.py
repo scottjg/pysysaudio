@@ -18,7 +18,7 @@ class SystemAudioRecorder:
     Record system audio on macOS and Windows.
 
     Platform support:
-        - macOS: Uses ScreenCaptureKit (requires macOS 13.0+)
+        - macOS: Uses CoreAudio process taps (requires macOS 14.2+)
         - Windows: Uses WASAPI loopback capture
 
     Example:
@@ -154,7 +154,7 @@ class SystemAudioRecorder:
             self._actual_channels = channels
             self._actual_sample_rate = int(
                 sample_rate
-            )  # Get actual sample rate from ScreenCaptureKit
+            )  # Get actual sample rate from native capture backend
 
         # Convert data to requested format (includes resampling if needed)
         converted_data = self._convert_audio_data(data, sample_count, channels)
@@ -529,7 +529,7 @@ class SystemAudioRecorder:
     @staticmethod
     def check_permission() -> bool:
         """
-        Check if Screen Recording permission is granted (macOS only).
+        Check if native system-capture support is available (macOS only).
 
         On Windows, always returns True as WASAPI loopback doesn't require special permissions.
 
