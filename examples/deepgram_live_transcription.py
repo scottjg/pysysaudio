@@ -5,11 +5,10 @@ Example: Live transcription by streaming audio to Deepgram Nova-3
 Requirements:
 - Environment variable DEEPGRAM_API_KEY must be set
 - pip install deepgram-sdk
-- pip install numpy
 
 Notes:
 - We request 16kHz mono in int16 format (PCM16/linear16)
-- pysysaudio automatically resamples (48kHz→16kHz) and converts to int16
+- pysysaudio resamples (48kHz→16kHz) and converts to int16 natively
 - Audio frames are sent as PCM16 (little-endian) raw bytes
 - Deepgram provides real-time transcription
 - Interim results show partial transcriptions as speech is in progress

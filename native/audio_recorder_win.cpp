@@ -1,6 +1,7 @@
 #ifdef _WIN32
 
 #include "audio_recorder.h"
+#include "format_converter.h"
 #include "ring_buffer.h"
 #include <iostream>
 #include <vector>
@@ -10,6 +11,8 @@
 #include <fstream>
 #include <cstring>
 #include <chrono>
+#include <memory>
+#include <stdexcept>
 
 // Windows Audio API includes
 #include <windows.h>
@@ -41,8 +44,12 @@ namespace pysysaudio {
 
 class AudioRecorder::Impl {
 public:
-    Impl(const std::string& output_path, double buffer_seconds)
+    Impl(const std::string& output_path, int sample_rate, int channels,
+         const std::string& dtype, double buffer_seconds)
         : output_path_(output_path)
+        , output_sample_rate_(sample_rate)
+        , output_channels_(channels)
+        , output_type_(parse_sample_type(dtype))
         , buffer_seconds_(buffer_seconds > 0.0 ? buffer_seconds : 2.0)
         , is_recording_(false)
         , capture_thread_(nullptr)
@@ -53,6 +60,10 @@ public:
         , pRenderClient_(nullptr)
         , pRenderService_(nullptr)
         , bytes_recorded_(0) {
+        
+        if (sample_rate <= 0 || channels <= 0) {
+            throw std::invalid_argument("sample_rate and channels must be positive");
+        }
         
         // Initialize COM
         HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -134,6 +145,24 @@ public:
         queue_.reset(static_cast<size_t>(
             buffer_seconds_ * actual_sample_rate_ * actual_channels_));
         
+        // Converters: one for read() on the reader's thread, and one for the WAV
+        // file (16-bit, requested rate and channels) on the capture thread.
+        try {
+            converter_ = std::make_unique<FormatConverter>(
+                actual_sample_rate_, actual_channels_,
+                output_sample_rate_, output_channels_, output_type_);
+            if (!output_path_.empty()) {
+                file_converter_ = std::make_unique<FormatConverter>(
+                    actual_sample_rate_, actual_channels_,
+                    output_sample_rate_, output_channels_, SampleType::Int16);
+            }
+        } catch (...) {
+            CoTaskMemFree(pwfx);
+            throw;
+        }
+        flushed_ = false;
+        bytes_recorded_ = 0;
+        
         // Optional: Uncomment for debugging audio format issues
         // std::cout << "WASAPI: " << actual_sample_rate_ << " Hz, " 
         //           << actual_channels_ << " ch, " << pwfx->wBitsPerSample << " bit" << std::endl;
@@ -181,8 +210,8 @@ public:
             
             // Write WAV header (will update at the end)
             WAVHeader header;
-            header.num_channels = actual_channels_;
-            header.sample_rate = actual_sample_rate_;
+            header.num_channels = static_cast<uint16_t>(output_channels_);
+            header.sample_rate = static_cast<uint32_t>(output_sample_rate_);
             header.bits_per_sample = 16;
             header.block_align = header.num_channels * header.bits_per_sample / 8;
             header.byte_rate = header.sample_rate * header.block_align;
@@ -262,14 +291,26 @@ public:
         
         // Flush and finalize WAV file
         if (wav_file_.is_open()) {
+            // The capture thread has exited, so the file converter is ours now.
+            // Write the resampler's tail before finalizing.
+            if (file_converter_) {
+                try {
+                    file_converter_->flush(file_bytes_);
+                    write_file_bytes();
+                } catch (...) {
+                    // Losing a few milliseconds of tail beats an unfinalized file.
+                }
+                file_converter_.reset();
+            }
+            
             // Flush any pending writes
             wav_file_.flush();
             
             // Update WAV header with final sizes
             wav_file_.seekp(0, std::ios::beg);
             WAVHeader header;
-            header.num_channels = actual_channels_;
-            header.sample_rate = actual_sample_rate_;
+            header.num_channels = static_cast<uint16_t>(output_channels_);
+            header.sample_rate = static_cast<uint32_t>(output_sample_rate_);
             header.bits_per_sample = 16;
             header.block_align = header.num_channels * header.bits_per_sample / 8;
             header.byte_rate = header.sample_rate * header.block_align;
@@ -292,17 +333,35 @@ public:
         return is_recording_;
     }
     
-    double sample_rate() const {
+    double capture_sample_rate() const {
         return static_cast<double>(actual_sample_rate_);
     }
     
-    int channels() const {
+    int capture_channels() const {
         return actual_channels_;
     }
     
-    void read(std::vector<float>& out, size_t max_frames, double timeout_seconds) {
+    bool read(std::vector<uint8_t>& out, size_t max_frames, double timeout_seconds) {
+        out.clear();
+        if (!converter_) {
+            return false;  // Never started.
+        }
         const size_t channels = actual_channels_ > 0 ? static_cast<size_t>(actual_channels_) : 1;
-        queue_.wait_and_pop(out, max_frames * channels, timeout_seconds);
+        queue_.wait_and_pop(raw_, max_frames * channels, timeout_seconds);
+        if (!raw_.empty()) {
+            converter_->process(raw_.data(), raw_.size() / channels, out);
+            return true;
+        }
+        // Nothing arrived. Once stopped and drained, hand back the resampler's
+        // tail exactly once, then report the end.
+        if (queue_.closed() && queue_.available() == 0) {
+            if (flushed_) {
+                return false;
+            }
+            flushed_ = true;
+            converter_->flush(out);
+        }
+        return true;
     }
     
     size_t dropped_frames() const {
@@ -401,6 +460,14 @@ private:
     }
     
     void capture_thread_func(WAVEFORMATEX format) {
+        // The file converter's Media Foundation resampler is used from this
+        // thread, so join the multithreaded apartment for its lifetime.
+        const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        struct ComScope {
+            bool active;
+            ~ComScope() { if (active) CoUninitialize(); }
+        } com_scope{co == S_OK || co == S_FALSE};
+        
         // Set thread priority for real-time audio
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
         
@@ -520,31 +587,45 @@ private:
             queue_.push(float_samples.data(), total_samples);
         }
         
-        // Write to WAV file if open
-        if (wav_file_.is_open()) {
+        // Write to WAV file if open: remix, resample and convert to 16-bit in
+        // the requested format.
+        if (wav_file_.is_open() && file_converter_) {
             std::lock_guard<std::mutex> lock(file_mutex_);
-            
-            // Convert float to int16 for WAV file
-            std::vector<int16_t> int16_samples(total_samples);
-            for (size_t i = 0; i < total_samples; i++) {
-                float sample = float_samples[i];
-                // Clamp to -1.0 to 1.0
-                if (sample > 1.0f) sample = 1.0f;
-                if (sample < -1.0f) sample = -1.0f;
-                int16_samples[i] = static_cast<int16_t>(sample * 32767.0f);
+            try {
+                file_converter_->process(float_samples.data(), numFrames, file_bytes_);
+                write_file_bytes();
+            } catch (const std::exception& e) {
+                std::cerr << "pysysaudio: WAV conversion failed: " << e.what() << std::endl;
             }
-            
-            wav_file_.write(reinterpret_cast<const char*>(int16_samples.data()), 
-                           int16_samples.size() * sizeof(int16_t));
-            bytes_recorded_ += int16_samples.size() * sizeof(int16_t);
         }
     }
     
+    void write_file_bytes() {
+        if (file_bytes_.empty()) {
+            return;
+        }
+        wav_file_.write(reinterpret_cast<const char*>(file_bytes_.data()),
+                        static_cast<std::streamsize>(file_bytes_.size()));
+        bytes_recorded_ += static_cast<uint32_t>(file_bytes_.size());
+    }
+    
     std::string output_path_;
+    int output_sample_rate_;
+    int output_channels_;
+    SampleType output_type_;
     double buffer_seconds_;
     std::atomic<bool> is_recording_;
     std::thread* capture_thread_;
     SampleQueue queue_;
+    
+    // Reader-thread state
+    std::unique_ptr<FormatConverter> converter_;
+    std::vector<float> raw_;
+    bool flushed_ = false;
+    
+    // WAV conversion, used on the capture thread until it exits, then by stop()
+    std::unique_ptr<FormatConverter> file_converter_;
+    std::vector<uint8_t> file_bytes_;
     
     // Windows Audio API objects
     IMMDeviceEnumerator* pEnumerator_;
@@ -569,8 +650,9 @@ private:
 };
 
 // AudioRecorder implementation
-AudioRecorder::AudioRecorder(const std::string& output_path, double buffer_seconds)
-    : pImpl(std::make_unique<Impl>(output_path, buffer_seconds)) {
+AudioRecorder::AudioRecorder(const std::string& output_path, int sample_rate, int channels,
+                             const std::string& dtype, double buffer_seconds)
+    : pImpl(std::make_unique<Impl>(output_path, sample_rate, channels, dtype, buffer_seconds)) {
 }
 
 AudioRecorder::~AudioRecorder() = default;
@@ -587,16 +669,16 @@ bool AudioRecorder::is_recording() const {
     return pImpl->is_recording();
 }
 
-double AudioRecorder::sample_rate() const {
-    return pImpl->sample_rate();
+double AudioRecorder::capture_sample_rate() const {
+    return pImpl->capture_sample_rate();
 }
 
-int AudioRecorder::channels() const {
-    return pImpl->channels();
+int AudioRecorder::capture_channels() const {
+    return pImpl->capture_channels();
 }
 
-void AudioRecorder::read(std::vector<float>& out, size_t max_frames, double timeout_seconds) {
-    pImpl->read(out, max_frames, timeout_seconds);
+bool AudioRecorder::read(std::vector<uint8_t>& out, size_t max_frames, double timeout_seconds) {
+    return pImpl->read(out, max_frames, timeout_seconds);
 }
 
 size_t AudioRecorder::dropped_frames() const {

@@ -31,6 +31,7 @@ if system == "Darwin":
             "pysysaudio._pysysaudio_native",
             sources=[
                 "native/audio_recorder.mm",
+                "native/resampler_mac.mm",
                 "native/bindings.cpp",
             ],
             include_dirs=[
@@ -63,6 +64,7 @@ elif system == "Windows":
             "pysysaudio._pysysaudio_native",
             sources=[
                 "native/audio_recorder_win.cpp",
+                "native/resampler_win.cpp",
                 "native/bindings.cpp",
             ],
             include_dirs=[
@@ -78,6 +80,10 @@ elif system == "Windows":
                 "ole32",
                 "oleaut32",
                 "uuid",
+                # Media Foundation resampler
+                "mfplat",
+                "mfuuid",
+                "wmcodecdspuuid",
             ],
         ),
     ]

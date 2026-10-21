@@ -104,6 +104,13 @@ public:
         cv_.notify_all();
     }
 
+    // True once close() was called. Pushes cannot happen after that, so
+    // closed() && available() == 0 means the stream is fully drained.
+    bool closed() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return closed_;
+    }
+
     size_t available() const noexcept {
         return write_pos_.load(std::memory_order_acquire) -
                read_pos_.load(std::memory_order_acquire);

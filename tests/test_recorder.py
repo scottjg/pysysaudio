@@ -2,8 +2,10 @@
 Tests for pysysaudio recorder functionality
 """
 
+import math
 import pytest
 import tempfile
+import wave
 import os
 import struct
 import platform
@@ -162,82 +164,95 @@ def test_stream_without_recording():
     assert len(chunks) == 0
 
 
-def test_bytes_resample_without_numpy():
-    """Ensure bytes format can resample even when numpy is unavailable."""
-    from pysysaudio import SystemAudioRecorder
+def _native():
+    from pysysaudio import _pysysaudio_native
 
-    recorder = SystemAudioRecorder(sample_rate=24000, channels=1, format="bytes", dtype="float32")
-    recorder._np = None  # Simulate numpy not being installed
-    recorder._actual_sample_rate = 48000
-    recorder._actual_channels = 2
-
-    frames = 4
-    input_channels = 2
-    sample_count = frames * input_channels
-    samples = [float(i) for i in range(sample_count)]
-    data = struct.pack(f"<{sample_count}f", *samples)
-
-    result = recorder._convert_audio_data(data, sample_count, input_channels)
-    expected_frames = int(frames * recorder.sample_rate / recorder._actual_sample_rate)
-    assert len(result) == expected_frames * recorder.channels * 4  # float32 bytes
-
-    output_samples = struct.unpack(f"<{expected_frames * recorder.channels}f", result)
-    # Mono frames are 0.5, 2.5, 4.5, 6.5; a 2:1 decimation reads frames 0 and 2.
-    assert output_samples == pytest.approx((0.5, 4.5))
+    return _pysysaudio_native
 
 
-def test_bytes_int16_conversion_without_numpy():
-    """Ensure dtype conversion works without numpy dependency."""
-    from pysysaudio import SystemAudioRecorder
-
-    recorder = SystemAudioRecorder(format="bytes", dtype="int16")
-    recorder._np = None  # Simulate numpy not being installed
-
-    data = struct.pack("<2f", -1.0, 1.0)
-    converted = recorder._convert_dtype(data)
-
-    ints = struct.unpack("<2h", converted)
-    assert ints == (-32767, 32767)
+def _pack(values):
+    return struct.pack(f"<{len(values)}f", *values)
 
 
-def _make_recorder(src_rate, dst_rate, in_channels, out_channels, use_numpy):
-    """Build a recorder with capture format pre-set, bypassing the native layer."""
-    from pysysaudio import SystemAudioRecorder
-
-    recorder = SystemAudioRecorder(
-        sample_rate=dst_rate, channels=out_channels, format="bytes", dtype="float32"
-    )
-    if not use_numpy:
-        recorder._np = None
-    recorder._actual_sample_rate = src_rate
-    recorder._actual_channels = in_channels
-    return recorder
+def _unpack(data):
+    return struct.unpack(f"<{len(data) // 4}f", data)
 
 
-def _sine_frames(rate, seconds, freq, channels):
+def _sine(rate, seconds, freq, channels, amplitude=0.5):
     """Interleaved float32 bytes of a sine wave, plus the frame count."""
-    import math
-
     frames = int(rate * seconds)
     values = []
     for i in range(frames):
-        v = math.sin(2 * math.pi * freq * i / rate)
+        v = amplitude * math.sin(2 * math.pi * freq * i / rate)
         values.extend([v] * channels)
-    return struct.pack(f"<{len(values)}f", *values), frames
+    return _pack(values), frames
 
 
-def _resample_in_chunks(recorder, data, frames, channels, chunk_frames):
-    """Push data through the resampler in fixed-size chunks and return the output."""
+def _convert(converter, data, frame_bytes, chunk_frames):
+    """Feed data through a converter in fixed-size chunks, then flush."""
     out = bytearray()
-    bytes_per_frame = channels * 4
-    for start in range(0, frames, chunk_frames):
-        chunk = data[start * bytes_per_frame : (start + chunk_frames) * bytes_per_frame]
-        chunk_frame_count = len(chunk) // bytes_per_frame
-        out += recorder._resample_and_remix(chunk, chunk_frame_count * channels, channels)
+    step = chunk_frames * frame_bytes
+    for start in range(0, len(data), step):
+        out += converter.process(data[start : start + step])
+    out += converter.flush()
     return bytes(out)
 
 
-@pytest.mark.parametrize("use_numpy", [True, False])
+def _rms(values):
+    return math.sqrt(sum(v * v for v in values) / len(values))
+
+
+def test_converter_passthrough_is_exact():
+    """Same rate and channel count with float32 out must not touch the samples."""
+    data = _pack([0.0, 0.25, -0.5, 1.0, -1.0, 0.125])
+    converter = _native().FormatConverter(48000, 2, 48000, 2, "float32")
+    assert converter.process(data) == data
+    assert converter.flush() == b""
+    assert converter.flush() == b""  # flushing twice is harmless
+
+
+@pytest.mark.parametrize(
+    "dtype,fmt,expected",
+    [
+        ("int16", "h", (-32767, -32767, -16383, 0, 16383, 32767, 32767)),
+        ("int32", "i", (-2147483647, -2147483647, -1073741823, 0, 1073741823, 2147483647, 2147483647)),
+    ],
+)
+def test_converter_encodes_integers(dtype, fmt, expected):
+    """Integers are clipped to [-1, 1], scaled by the type's max and truncated toward zero."""
+    data = _pack([-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0])
+    converter = _native().FormatConverter(48000, 1, 48000, 1, dtype)
+    out = converter.process(data)
+    assert struct.unpack(f"<{len(expected)}{fmt}", out) == expected
+
+
+@pytest.mark.parametrize(
+    "in_channels,out_channels,frame,expected",
+    [
+        (2, 1, [0.2, 0.6], [0.4]),  # downmix averages
+        (1, 2, [0.3], [0.3, 0.3]),  # mono duplicates
+        (1, 3, [0.3], [0.3, 0.3, 0.3]),
+        (3, 2, [0.1, 0.2, 0.3], [0.1, 0.2]),  # extra channels dropped
+        (2, 3, [0.1, 0.2], [0.1, 0.2, 0.0]),  # missing channels silent
+    ],
+)
+def test_converter_remixes_channels(in_channels, out_channels, frame, expected):
+    converter = _native().FormatConverter(48000, in_channels, 48000, out_channels, "float32")
+    out = _unpack(converter.process(_pack(frame * 4)))
+    assert out == pytest.approx(expected * 4)
+
+
+def test_converter_rejects_bad_input():
+    native = _native()
+    with pytest.raises(ValueError):
+        native.FormatConverter(48000, 2, 16000, 1, "float64")
+    with pytest.raises(ValueError):
+        native.FormatConverter(48000, 0, 16000, 1, "float32")
+    converter = native.FormatConverter(48000, 2, 16000, 1, "float32")
+    with pytest.raises(ValueError):
+        converter.process(b"\x00" * 12)  # one and a half stereo frames
+
+
 @pytest.mark.parametrize(
     "src_rate,dst_rate,in_channels,out_channels",
     [
@@ -246,79 +261,55 @@ def _resample_in_chunks(recorder, data, frames, channels, chunk_frames):
         (44100, 48000, 1, 2),  # non-integer ratio up with upmix
     ],
 )
-def test_resampler_is_continuous_across_chunks(
-    src_rate, dst_rate, in_channels, out_channels, use_numpy
+def test_native_resampler_is_continuous_and_exact(
+    src_rate, dst_rate, in_channels, out_channels
 ):
-    """Chunked resampling must equal whole-signal resampling and keep an exact rate."""
-    if use_numpy:
-        pytest.importorskip("numpy")
+    """Chunked conversion matches whole-signal conversion, keeps the rate and the tone."""
+    native = _native()
+    freq = 440.0
+    data, frames = _sine(src_rate, 0.25, freq, in_channels)
+    frame_bytes = 4 * in_channels
 
-    seconds = 0.2 if use_numpy else 0.05
-    data, frames = _sine_frames(src_rate, seconds, 440.0, in_channels)
-
-    chunked = _resample_in_chunks(
-        _make_recorder(src_rate, dst_rate, in_channels, out_channels, use_numpy),
-        data,
-        frames,
-        in_channels,
-        chunk_frames=512,
+    chunked = _convert(
+        native.FormatConverter(src_rate, in_channels, dst_rate, out_channels, "float32"),
+        data, frame_bytes, chunk_frames=512,
     )
-    whole = _resample_in_chunks(
-        _make_recorder(src_rate, dst_rate, in_channels, out_channels, use_numpy),
-        data,
-        frames,
-        in_channels,
-        chunk_frames=frames,
+    whole = _convert(
+        native.FormatConverter(src_rate, in_channels, dst_rate, out_channels, "float32"),
+        data, frame_bytes, chunk_frames=frames,
     )
 
-    # Identical bytes: chunk boundaries leave no trace in the output.
-    assert chunked == whole
+    # Chunk boundaries leave no trace in the output.
+    assert _unpack(chunked) == pytest.approx(_unpack(whole), abs=1e-6)
 
-    # The output length tracks the input length at the target rate to within one frame.
-    out_frames = len(chunked) // (out_channels * 4)
-    expected_frames = frames * dst_rate / src_rate
-    assert abs(out_frames - expected_frames) <= 1
+    # After flush, the output length matches the input duration at the new rate.
+    out_frames = len(chunked) // (4 * out_channels)
+    assert abs(out_frames - frames * dst_rate / src_rate) <= 4
 
-    # The output is the same sine wave at the new rate: no drift, no pitch shift.
-    import math
-
-    samples = struct.unpack(f"<{out_frames * out_channels}f", chunked)
-    worst = 0.0
-    for n in range(out_frames):
-        ideal = math.sin(2 * math.pi * 440.0 * n / dst_rate)
-        for ch in range(out_channels):
-            worst = max(worst, abs(samples[n * out_channels + ch] - ideal))
-    assert worst < 0.01
-
-
-def test_pure_python_resampler_matches_numpy():
-    """The dependency-free fallback must produce the same samples as the numpy path."""
-    pytest.importorskip("numpy")
-
-    data, frames = _sine_frames(48000, 0.05, 440.0, 2)
-    with_numpy = _resample_in_chunks(
-        _make_recorder(48000, 16000, 2, 1, True), data, frames, 2, chunk_frames=500
+    # Every output channel carries the same tone at the new rate. Allow for a fixed
+    # filter delay, but no drift: one lag must fit the whole middle of the signal.
+    first = _unpack(chunked)[::out_channels]
+    margin = dst_rate // 20
+    ideal = [0.5 * math.sin(2 * math.pi * freq * n / dst_rate) for n in range(len(first))]
+    best = min(
+        max(abs(first[n + lag] - ideal[n]) for n in range(margin, len(first) - margin - 64))
+        for lag in range(0, 65)
     )
-    pure = _resample_in_chunks(
-        _make_recorder(48000, 16000, 2, 1, False), data, frames, 2, chunk_frames=500
-    )
-
-    assert len(with_numpy) == len(pure)
-    a = struct.unpack(f"<{len(with_numpy) // 4}f", with_numpy)
-    b = struct.unpack(f"<{len(pure) // 4}f", pure)
-    assert a == pytest.approx(b, abs=1e-6)
+    assert best < 0.01
 
 
-def test_resampler_state_resets_between_recordings():
-    """A new recording must not inherit the read position from the previous one."""
-    recorder = _make_recorder(48000, 44100, 1, 1, False)
-    data, frames = _sine_frames(48000, 0.01, 440.0, 1)
-    recorder._resample_and_remix(data, frames, 1)
-    assert recorder._resample_prev is not None
+def test_native_resampler_rejects_aliases():
+    """A tone above the new Nyquist frequency must be filtered out, not folded back."""
+    native = _native()
+    margin = 800
 
-    recorder._reset_resampler_state()
-    assert recorder._resample_prev is None
-    assert recorder._resample_phase_num == 0
+    data, _ = _sine(48000, 0.25, 10000.0, 1)  # 10 kHz is above 16 kHz's 8 kHz Nyquist
+    aliased = _unpack(_convert(native.FormatConverter(48000, 1, 16000, 1), data, 4, 512))
+    assert _rms(aliased[margin:-margin]) < 0.01
+
+    data, _ = _sine(48000, 0.25, 1000.0, 1)  # in-band tone passes at full level
+    passed = _unpack(_convert(native.FormatConverter(48000, 1, 16000, 1), data, 4, 512))
+    assert _rms(passed[margin:-margin]) == pytest.approx(0.5 / math.sqrt(2), rel=0.02)
 
 
 def test_buffer_size_is_deprecated():
@@ -388,69 +379,79 @@ def test_stream_ends_when_stopped_from_another_thread():
     assert all(isinstance(c, bytes) for c in chunks)
 
 
-@pytest.mark.parametrize("dtype", ["float32", "int16", "int32"])
-@pytest.mark.parametrize(
-    "out_channels,src_rate,dst_rate",
-    [
-        (1, 48000, 48000),  # mono, no resampling
-        (1, 48000, 16000),  # mono via downmix and resample
-        (2, 48000, 48000),  # stereo passthrough
-        (2, 48000, 44100),  # stereo resampled
-    ],
-)
-def test_numpy_output_is_always_2d(dtype, out_channels, src_rate, dst_rate):
+@pytest.mark.parametrize("dtype,size", [("float32", 4), ("int16", 2), ("int32", 4)])
+@pytest.mark.parametrize("channels", [1, 2, 3])
+def test_numpy_output_is_always_2d(dtype, size, channels):
     """numpy chunks are (frames, channels) for every channel count, mono included."""
     np = pytest.importorskip("numpy")
     from pysysaudio import SystemAudioRecorder
 
-    recorder = SystemAudioRecorder(
-        sample_rate=dst_rate, channels=out_channels, format="numpy", dtype=dtype
-    )
-    recorder._actual_sample_rate = src_rate
-    recorder._actual_channels = 2
+    recorder = SystemAudioRecorder(channels=channels, format="numpy", dtype=dtype)
+    chunk = recorder._format_output(bytes(480 * channels * size))
 
-    frames = 480
-    data = np.zeros(frames * 2, dtype=np.float32).tobytes()
-    chunk = recorder._convert_audio_data(data, frames * 2, 2)
-
-    assert chunk.ndim == 2
-    assert chunk.shape[1] == out_channels
+    assert chunk.shape == (480, channels)
     assert chunk.dtype == np.dtype(dtype)
-    assert abs(chunk.shape[0] - frames * dst_rate / src_rate) <= 1
 
 
-def test_numpy_mono_capture_without_conversion_is_2d():
-    """A mono capture delivered as mono must still come back as (frames, 1)."""
+def test_numpy_mono_values_land_in_column_zero():
     np = pytest.importorskip("numpy")
     from pysysaudio import SystemAudioRecorder
 
-    recorder = SystemAudioRecorder(sample_rate=48000, channels=1, format="numpy")
-    recorder._actual_sample_rate = 48000
-    recorder._actual_channels = 1
-
-    data = np.arange(5, dtype=np.float32).tobytes()
-    chunk = recorder._convert_audio_data(data, 5, 1)
+    recorder = SystemAudioRecorder(channels=1, format="numpy")
+    chunk = recorder._format_output(np.arange(5, dtype=np.float32).tobytes())
 
     assert chunk.shape == (5, 1)
     assert chunk[:, 0].tolist() == [0.0, 1.0, 2.0, 3.0, 4.0]
 
 
-@pytest.mark.parametrize("out_channels", [1, 2])
-def test_mlx_output_is_always_2d(out_channels):
+@pytest.mark.parametrize("channels", [1, 2])
+def test_mlx_output_is_always_2d(channels):
     """mlx chunks share the numpy shape contract."""
-    np = pytest.importorskip("numpy")
+    pytest.importorskip("numpy")
     pytest.importorskip("mlx.core")
     from pysysaudio import SystemAudioRecorder
 
-    recorder = SystemAudioRecorder(sample_rate=48000, channels=out_channels, format="mlx")
-    recorder._actual_sample_rate = 48000
-    recorder._actual_channels = 2
+    recorder = SystemAudioRecorder(channels=channels, format="mlx")
+    chunk = recorder._format_output(bytes(480 * channels * 4))
 
-    data = np.zeros(960, dtype=np.float32).tobytes()
-    chunk = recorder._convert_audio_data(data, 960, 2)
+    assert tuple(chunk.shape) == (480, channels)
 
-    assert tuple(chunk.shape) == (480, out_channels)
 
+def test_invalid_settings_are_rejected():
+    from pysysaudio import SystemAudioRecorder
+
+    with pytest.raises(ValueError):
+        SystemAudioRecorder(dtype="float64")
+    with pytest.raises(ValueError):
+        SystemAudioRecorder(format="list")
+    with pytest.raises(ValueError):
+        SystemAudioRecorder(channels=0)
+
+
+@pytest.mark.skipif(
+    not _macos_supports_coreaudio_taps(),
+    reason="CoreAudio process taps require macOS 14.2+",
+)
+def test_wav_file_uses_requested_format():
+    """The file is written at the requested rate and channel count, as 16-bit PCM."""
+    from pysysaudio import SystemAudioRecorder
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        recorder = SystemAudioRecorder(sample_rate=16000, channels=1, dtype="float32")
+        recorder.start_recording(tmp_path)
+        time.sleep(0.5)
+        recorder.stop_recording()
+
+        with wave.open(tmp_path) as w:
+            assert w.getframerate() == 16000
+            assert w.getnchannels() == 1
+            assert w.getsampwidth() == 2
+            assert 0.3 * 16000 <= w.getnframes() <= 0.8 * 16000
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -6,6 +6,7 @@
 #import <AudioToolbox/AudioToolbox.h>
 
 #include "audio_recorder.h"
+#include "format_converter.h"
 #include "ring_buffer.h"
 #include <algorithm>
 #include <atomic>
@@ -36,19 +37,26 @@ namespace pysysaudio {
 
 class AudioRecorder::Impl {
 public:
-    Impl(const std::string& output_path, double buffer_seconds)
+    Impl(const std::string& output_path, int sample_rate, int channels,
+         const std::string& dtype, double buffer_seconds)
         : output_path_(output_path),
+          output_sample_rate_(sample_rate),
+          output_channels_(channels),
+          output_type_(parse_sample_type(dtype)),
           buffer_seconds_(buffer_seconds > 0.0 ? buffer_seconds : 2.0),
           is_recording_(false),
           tap_id_(kAudioObjectUnknown),
           aggregate_device_id_(kAudioObjectUnknown),
           io_proc_id_(nullptr),
           audio_file_(nullptr) {
+        if (sample_rate <= 0 || channels <= 0) {
+            throw std::invalid_argument("sample_rate and channels must be positive");
+        }
         std::memset(&tap_format_, 0, sizeof(tap_format_));
-        // Reserve a large buffer (~256KB) to avoid real-time reallocation.
-        // 65536 frames * 1 channel * 4 bytes = 256KB.
-        // Typical buffer is < 4096 frames.
+        // Reserve large buffers so the IOProc never reallocates. Typical
+        // buffers are under 4096 frames.
         io_buffer_.reserve(65536);
+        file_buffer_.reserve(16384 * static_cast<size_t>(channels));
     }
 
     ~Impl() {
@@ -77,6 +85,19 @@ public:
             create_tap_and_aggregate_device();
             configure_output_file_if_needed();
         }
+
+        // Converter for read(): capture format in, requested format out. Created
+        // here, used only on the reader's thread.
+        try {
+            converter_ = std::make_unique<FormatConverter>(
+                tap_format_.mSampleRate, static_cast<int>(tap_format_.mChannelsPerFrame),
+                static_cast<double>(output_sample_rate_), output_channels_, output_type_);
+        } catch (...) {
+            cleanup_audio_file();
+            cleanup_device_and_tap();
+            throw;
+        }
+        flushed_ = false;
 
         // Size the queue for the capture format now that it is known. This is the
         // only allocation on the capture path and it happens before capture starts.
@@ -129,13 +150,31 @@ public:
 
     bool is_recording() const { return is_recording_.load(std::memory_order_relaxed); }
 
-    double sample_rate() const { return tap_format_.mSampleRate; }
+    double capture_sample_rate() const { return tap_format_.mSampleRate; }
 
-    int channels() const { return static_cast<int>(tap_format_.mChannelsPerFrame); }
+    int capture_channels() const { return static_cast<int>(tap_format_.mChannelsPerFrame); }
 
-    void read(std::vector<float>& out, size_t max_frames, double timeout_seconds) {
+    bool read(std::vector<uint8_t>& out, size_t max_frames, double timeout_seconds) {
+        out.clear();
+        if (!converter_) {
+            return false;  // Never started.
+        }
         const size_t channels = tap_format_.mChannelsPerFrame > 0 ? tap_format_.mChannelsPerFrame : 1;
-        queue_.wait_and_pop(out, max_frames * channels, timeout_seconds);
+        queue_.wait_and_pop(raw_, max_frames * channels, timeout_seconds);
+        if (!raw_.empty()) {
+            converter_->process(raw_.data(), raw_.size() / channels, out);
+            return true;
+        }
+        // Nothing arrived. Once stopped and drained, hand back the resampler's
+        // tail exactly once, then report the end.
+        if (queue_.closed() && queue_.available() == 0) {
+            if (flushed_) {
+                return false;
+            }
+            flushed_ = true;
+            converter_->flush(out);
+        }
+        return true;
     }
 
     size_t dropped_frames() const {
@@ -229,12 +268,15 @@ private:
         NSURL* output_url = [NSURL fileURLWithPath:output_path];
         [[NSFileManager defaultManager] removeItemAtURL:output_url error:nil];
 
+        // The file is written in the requested format. The IOProc remixes to the
+        // requested channel count (cheap, allocation-free); ExtAudioFile's own
+        // AudioConverter resamples on its background writer thread.
         AudioStreamBasicDescription file_format = {};
-        file_format.mSampleRate = tap_format_.mSampleRate;
+        file_format.mSampleRate = static_cast<double>(output_sample_rate_);
         file_format.mFormatID = kAudioFormatLinearPCM;
         file_format.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
         file_format.mBitsPerChannel = 16;
-        file_format.mChannelsPerFrame = tap_format_.mChannelsPerFrame;
+        file_format.mChannelsPerFrame = static_cast<UInt32>(output_channels_);
         file_format.mFramesPerPacket = 1;
         file_format.mBytesPerFrame = file_format.mChannelsPerFrame * sizeof(int16_t);
         file_format.mBytesPerPacket = file_format.mBytesPerFrame;
@@ -255,7 +297,7 @@ private:
         client_format.mFormatFlags =
             kAudioFormatFlagIsFloat | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked;
         client_format.mBitsPerChannel = 32;
-        client_format.mChannelsPerFrame = tap_format_.mChannelsPerFrame;
+        client_format.mChannelsPerFrame = static_cast<UInt32>(output_channels_);
         client_format.mFramesPerPacket = 1;
         client_format.mBytesPerFrame = client_format.mChannelsPerFrame * sizeof(float);
         client_format.mBytesPerPacket = client_format.mBytesPerFrame;
@@ -267,6 +309,21 @@ private:
         if (status != noErr) {
             cleanup_audio_file();
             throw_osstatus("Failed to configure output WAV client format", status);
+        }
+
+        // Match the stream's resampling quality. Changing the converter's
+        // settings requires pushing an empty config back afterwards.
+        AudioConverterRef file_converter = nullptr;
+        UInt32 converter_size = sizeof(file_converter);
+        if (ExtAudioFileGetProperty(audio_file_, kExtAudioFileProperty_AudioConverter,
+                                    &converter_size, &file_converter) == noErr &&
+            file_converter != nullptr) {
+            UInt32 quality = kAudioConverterQuality_Max;
+            AudioConverterSetProperty(file_converter, kAudioConverterSampleRateConverterQuality,
+                                      sizeof(quality), &quality);
+            CFArrayRef no_config = nullptr;
+            ExtAudioFileSetProperty(audio_file_, kExtAudioFileProperty_ConverterConfig,
+                                    sizeof(no_config), &no_config);
         }
 
         // Prime the asynchronous writer. Its first call allocates its internal
@@ -290,12 +347,18 @@ private:
         queue_.push(io_buffer_.data(), io_buffer_.size());
 
         if (audio_file_ != nullptr && frames > 0) {
+            // Remix to the requested channel count; resampling happens inside
+            // ExtAudioFile. resize() stays within the reserved capacity.
+            file_buffer_.resize(static_cast<size_t>(frames) * output_channels_);
+            remix_channels(io_buffer_.data(), frames, static_cast<int>(channels),
+                           file_buffer_.data(), output_channels_);
+
             AudioBufferList list;
             list.mNumberBuffers = 1;
-            list.mBuffers[0].mNumberChannels = channels;
+            list.mBuffers[0].mNumberChannels = static_cast<UInt32>(output_channels_);
             list.mBuffers[0].mDataByteSize =
-                static_cast<UInt32>(io_buffer_.size() * sizeof(float));
-            list.mBuffers[0].mData = io_buffer_.data();
+                static_cast<UInt32>(file_buffer_.size() * sizeof(float));
+            list.mBuffers[0].mData = file_buffer_.data();
             ExtAudioFileWriteAsync(audio_file_, frames, &list);
         }
 
@@ -422,6 +485,9 @@ private:
     }
 
     std::string output_path_;
+    int output_sample_rate_;
+    int output_channels_;
+    SampleType output_type_;
     double buffer_seconds_;
     std::atomic<bool> is_recording_;
     AudioObjectID tap_id_;
@@ -430,11 +496,18 @@ private:
     ExtAudioFileRef audio_file_;
     AudioStreamBasicDescription tap_format_;
     SampleQueue queue_;
-    std::vector<float> io_buffer_;  // Pre-allocated; only touched from IOProc.
+    std::vector<float> io_buffer_;    // Pre-allocated; only touched from IOProc.
+    std::vector<float> file_buffer_;  // Pre-allocated; only touched from IOProc.
+
+    // Reader-thread state.
+    std::unique_ptr<FormatConverter> converter_;
+    std::vector<float> raw_;
+    bool flushed_ = false;
 };
 
-AudioRecorder::AudioRecorder(const std::string& output_path, double buffer_seconds)
-    : pImpl(std::make_unique<Impl>(output_path, buffer_seconds)) {}
+AudioRecorder::AudioRecorder(const std::string& output_path, int sample_rate, int channels,
+                             const std::string& dtype, double buffer_seconds)
+    : pImpl(std::make_unique<Impl>(output_path, sample_rate, channels, dtype, buffer_seconds)) {}
 
 AudioRecorder::~AudioRecorder() = default;
 
@@ -444,12 +517,12 @@ std::string AudioRecorder::stop() { return pImpl->stop(); }
 
 bool AudioRecorder::is_recording() const { return pImpl->is_recording(); }
 
-double AudioRecorder::sample_rate() const { return pImpl->sample_rate(); }
+double AudioRecorder::capture_sample_rate() const { return pImpl->capture_sample_rate(); }
 
-int AudioRecorder::channels() const { return pImpl->channels(); }
+int AudioRecorder::capture_channels() const { return pImpl->capture_channels(); }
 
-void AudioRecorder::read(std::vector<float>& out, size_t max_frames, double timeout_seconds) {
-    pImpl->read(out, max_frames, timeout_seconds);
+bool AudioRecorder::read(std::vector<uint8_t>& out, size_t max_frames, double timeout_seconds) {
+    return pImpl->read(out, max_frames, timeout_seconds);
 }
 
 size_t AudioRecorder::dropped_frames() const { return pImpl->dropped_frames(); }

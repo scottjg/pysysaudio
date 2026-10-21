@@ -9,9 +9,12 @@ recursive-include examples *.py *.md
 # them: setup.py only lists the current platform's sources in ext_modules,
 # so setuptools will not pick up the other platform's files on its own.
 include native/audio_recorder.h
+include native/format_converter.h
 include native/ring_buffer.h
 include native/audio_recorder.mm
+include native/resampler_mac.mm
 include native/audio_recorder_win.cpp
+include native/resampler_win.cpp
 include native/bindings.cpp
 
 # Build/packaging files

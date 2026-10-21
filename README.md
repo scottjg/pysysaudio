@@ -8,7 +8,7 @@ A Python library for recording system audio on **macOS** and **Windows**.
 - 🪟 **Cross-platform**: macOS (ScreenCaptureKit) and Windows (WASAPI)
 - 🎚️ Configurable sample rate and channel count
 - 🔧 Configurable output formats: bytes, NumPy, or MLX arrays
-- 🎛️ Automatic resampling and channel remixing
+- 🎛️ Automatic resampling and channel remixing with each platform's native resampler, for both streams and WAV files
 
 ## Requirements
 
@@ -180,7 +180,7 @@ SystemAudioRecorder(
 
 Start recording system audio.
 
-- `output_path`: Optional path where the WAV file will be saved. If `None`, audio is only available via `stream()`.
+- `output_path`: Optional path where the WAV file will be saved. If `None`, audio is only available via `stream()`. The file is written at the requested `sample_rate` and `channels` as 16-bit PCM, whatever `dtype` is set to.
 
 You can save to a file, stream audio via `stream()`, or both simultaneously.
 
@@ -239,10 +239,13 @@ To grant permission:
 `pysysaudio` uses platform-native APIs for optimal performance:
 
 ### macOS
-Uses CoreAudio process taps to capture system audio (requires macOS 14.2+).
+Uses CoreAudio process taps to capture system audio (requires macOS 14.2+). Resampling uses CoreAudio's AudioConverter at its highest quality setting.
 
 ### Windows  
-Uses WASAPI (Windows Audio Session API) in loopback mode to capture audio from the default output device.
+Uses WASAPI (Windows Audio Session API) in loopback mode to capture audio from the default output device. Resampling uses the Media Foundation audio resampler with its longest filter.
+
+### Format conversion
+When the system's format differs from the one you asked for, audio is converted in this order: channels are remixed (averaged to mono, duplicated from mono, otherwise truncated or padded with silence), then resampled, then encoded as `dtype`. Conversion runs in native code on the thread that iterates `stream()`, never on the audio thread. NumPy is only needed for `format="numpy"` and `format="mlx"`.
 
 ## Development
 

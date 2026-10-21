@@ -21,7 +21,7 @@ def main():
     # - channels=1: mono
     # - format="bytes": raw PCM bytes
     # - dtype="int16": signed 16-bit (s16le on little-endian systems)
-    # Audio is automatically resampled from system's native 48kHz stereo to 16kHz mono
+    # Audio is resampled natively from the system's format (typically 48kHz stereo) to 16kHz mono
     recorder = SystemAudioRecorder(sample_rate=16000, channels=1, format="bytes", dtype="int16")
 
     # Log to stderr (stdout is for raw audio data)
