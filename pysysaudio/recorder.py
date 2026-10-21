@@ -71,6 +71,7 @@ class SystemAudioRecorder:
         self._stream_active = False
         self._actual_sample_rate = None  # Detected from system
         self._actual_channels = None  # Detected from first callback
+        self._reset_resampler_state()
 
         # Validate format and check dependencies
         # Note: numpy is always needed for automatic resampling, numpy format, or mlx format
@@ -124,6 +125,7 @@ class SystemAudioRecorder:
             # Reset actual rate/channels for new recording session
             self._actual_sample_rate = None
             self._actual_channels = None
+            self._reset_resampler_state()
 
             # Import the native module
             try:
@@ -158,28 +160,60 @@ class SystemAudioRecorder:
 
         # Convert data to requested format (includes resampling if needed)
         converted_data = self._convert_audio_data(data, sample_count, channels)
-
-        # Calculate output sample count after resampling
-        output_sample_count = sample_count
-        output_channels = channels
-        if self._actual_channels != self.channels or self._actual_sample_rate != self.sample_rate:
-            # Calculate output dimensions
-            frames = sample_count // channels
-            output_frames = int(frames * self.sample_rate / self._actual_sample_rate)
-            output_sample_count = output_frames * self.channels
-            output_channels = self.channels
+        if len(converted_data) == 0:
+            # A chunk can resample to nothing when the input is tiny; nothing to deliver.
+            return
 
         try:
             # Non-blocking put - if queue is full, drop the chunk
-            self._audio_queue.put_nowait((converted_data, output_sample_count, output_channels))
+            self._audio_queue.put_nowait(converted_data)
         except queue.Full:
             # Queue is full, drop this chunk
             # This prevents blocking the audio recording thread
             pass
 
+    def _reset_resampler_state(self) -> None:
+        """Forget the carried-over frame and read position from a previous recording."""
+        # Last remixed input frame of the previous chunk. Interpolation across a chunk
+        # boundary reads from it, so the output stream is continuous.
+        self._resample_prev: Optional[Any] = None
+        # Read position of the next output sample, in units of 1/sample_rate input frames,
+        # measured from the carried-over frame. Kept as an integer so it never drifts.
+        self._resample_phase_num = 0
+
+    def _resample_plan(self, available_frames: int) -> tuple:
+        """
+        Decide where in the current input buffer the output samples are read from.
+
+        The buffer holds the carried-over frame (if any) followed by the current chunk.
+        Output sample n is read at input position (start_num + n * src) / dst frames,
+        where src and dst are the input and output sample rates.
+
+        Returns (start_num, count) and advances the carried read position so the next
+        chunk picks up exactly where this one left off.
+        """
+        src = self._actual_sample_rate
+        dst = self.sample_rate
+        start_num = self._resample_phase_num
+        last = available_frames - 1
+
+        if last < 0 or start_num > last * dst:
+            count = 0
+        else:
+            count = (last * dst - start_num) // src + 1
+
+        # Re-express the next read position relative to the final frame of this buffer,
+        # which becomes index 0 of the next buffer.
+        self._resample_phase_num = start_num + count * src - max(last, 0) * dst
+        return start_num, count
+
     def _resample_and_remix(self, data: bytes, sample_count: int, channels: int) -> bytes:
         """
         Resample and remix audio to match requested sample rate and channels.
+
+        Resampling is stateful: the fractional read position and the last input frame are
+        carried from one chunk to the next, so consecutive chunks join seamlessly and the
+        output rate is exact over time.
 
         Args:
             data: Raw PCM bytes (float32)
@@ -192,53 +226,51 @@ class SystemAudioRecorder:
         if self._np is None:
             return self._resample_and_remix_pure_python(data, sample_count, channels)
 
-        # Convert bytes to numpy array for processing
-        audio = self._np.frombuffer(data, dtype=self._np.float32).copy()
+        np = self._np
         frames = sample_count // channels
-
-        # Reshape to (frames, channels) for processing
-        if channels > 1:
-            audio = audio.reshape(frames, channels)
-        else:
-            audio = audio.reshape(frames, 1)
+        audio = np.frombuffer(data, dtype=np.float32).reshape(frames, max(channels, 1))
 
         # Channel mixing (e.g., stereo to mono or mono to stereo)
         if channels != self.channels:
             if self.channels == 1 and channels > 1:
                 # Downmix to mono by averaging channels
-                audio = audio.mean(axis=1, keepdims=True)
+                audio = audio.mean(axis=1, keepdims=True, dtype=np.float32)
             elif self.channels == 2 and channels == 1:
                 # Upmix mono to stereo by duplicating
-                audio = self._np.tile(audio, (1, 2))
+                audio = np.tile(audio, (1, 2))
+            elif channels > self.channels:
+                audio = audio[:, : self.channels]
             else:
-                # For other channel combinations, just truncate or pad
-                if channels > self.channels:
-                    audio = audio[:, : self.channels]
-                else:
-                    # Pad with zeros
-                    padding = self._np.zeros(
-                        (frames, self.channels - channels), dtype=self._np.float32
-                    )
-                    audio = self._np.concatenate([audio, padding], axis=1)
+                padding = np.zeros((frames, self.channels - channels), dtype=np.float32)
+                audio = np.concatenate([audio, padding], axis=1)
 
-        # Sample rate conversion using linear interpolation for both up and down sampling
         if self._actual_sample_rate != self.sample_rate:
-            ratio = self.sample_rate / self._actual_sample_rate
-            new_frames = int(frames * ratio)
+            audio = self._resample_numpy(audio)
 
-            if new_frames != frames:
-                # Use linear interpolation to resample
-                old_indices = self._np.linspace(0, frames - 1, frames)
-                new_indices = self._np.linspace(0, frames - 1, new_frames)
+        return np.ascontiguousarray(audio, dtype=np.float32).tobytes()
 
-                # Interpolate each channel
-                resampled = self._np.zeros((new_frames, self.channels), dtype=self._np.float32)
-                for ch in range(self.channels):
-                    resampled[:, ch] = self._np.interp(new_indices, old_indices, audio[:, ch])
-                audio = resampled
+    def _resample_numpy(self, audio: Any) -> Any:
+        """Linear-interpolation resampling of a (frames, channels) float32 array."""
+        np = self._np
+        if self._resample_prev is not None:
+            buf = np.concatenate([self._resample_prev, audio], axis=0)
+        else:
+            buf = audio
 
-        # Flatten and convert back to bytes
-        return audio.flatten().tobytes()
+        start_num, count = self._resample_plan(buf.shape[0])
+        if buf.shape[0] > 0:
+            self._resample_prev = buf[-1:].copy()
+
+        if count == 0:
+            return np.zeros((0, buf.shape[1]), dtype=np.float32)
+
+        positions = (start_num + np.arange(count, dtype=np.int64) * self._actual_sample_rate) / (
+            self.sample_rate
+        )
+        idx = np.minimum(positions.astype(np.int64), buf.shape[0] - 1)
+        frac = (positions - idx).astype(np.float32)[:, None]
+        nxt = np.minimum(idx + 1, buf.shape[0] - 1)
+        return buf[idx] * (1.0 - frac) + buf[nxt] * frac
 
     def _resample_and_remix_pure_python(
         self, data: bytes, sample_count: int, channels: int
@@ -250,7 +282,7 @@ class SystemAudioRecorder:
         samples = array("f")
         samples.frombytes(data)
 
-        frames = sample_count // channels
+        frames = sample_count // channels if channels else 0
         working_channels = channels
 
         if working_channels != self.channels and frames > 0:
@@ -258,10 +290,8 @@ class SystemAudioRecorder:
             working_channels = self.channels
             frames = len(samples) // working_channels if working_channels else 0
 
-        if self._actual_sample_rate != self.sample_rate and frames > 0 and working_channels > 0:
-            samples = self._resample_frames_pure_python(
-                samples, frames, working_channels, self._actual_sample_rate, self.sample_rate
-            )
+        if self._actual_sample_rate != self.sample_rate and working_channels > 0:
+            samples = self._resample_pure_python(samples, frames, working_channels)
 
         return samples.tobytes()
 
@@ -301,70 +331,40 @@ class SystemAudioRecorder:
 
         return remixed
 
-    def _resample_frames_pure_python(
-        self,
-        samples: array,
-        frames: int,
-        channels: int,
-        actual_rate: int,
-        target_rate: int,
-    ) -> array:
-        """Pure Python linear interpolation resampling."""
-        if frames == 0 or channels == 0 or actual_rate == target_rate:
-            return samples
+    def _resample_pure_python(self, samples: array, frames: int, channels: int) -> array:
+        """Pure Python linear-interpolation resampling of interleaved float samples."""
+        # Prepend the carried-over frame so interpolation spans the chunk boundary.
+        if self._resample_prev is not None:
+            buf = array("f", self._resample_prev)
+            buf.extend(samples)
+            buf_frames = frames + 1
+        else:
+            buf = samples
+            buf_frames = frames
 
-        ratio = target_rate / actual_rate
-        new_frames = int(frames * ratio)
+        start_num, count = self._resample_plan(buf_frames)
+        if buf_frames > 0:
+            self._resample_prev = buf[(buf_frames - 1) * channels :]
 
-        if new_frames == frames:
-            return samples
-        if new_frames <= 0:
-            return array("f")
+        out = array("f")
+        if count == 0:
+            return out
 
-        per_channel = []
-        for ch in range(channels):
-            channel_values = [
-                samples[frame_idx * channels + ch] for frame_idx in range(frames)
-            ]
-            per_channel.append(channel_values)
-
-        resampled_channels = [
-            self._linear_resample_channel(channel_values, new_frames)
-            for channel_values in per_channel
-        ]
-
-        interleaved = array("f")
-        for frame_idx in range(new_frames):
+        src = self._actual_sample_rate
+        dst = self.sample_rate
+        last = buf_frames - 1
+        for n in range(count):
+            num = start_num + n * src
+            idx = min(num // dst, last)
+            frac = (num - idx * dst) / dst
+            nxt = min(idx + 1, last)
+            base = idx * channels
+            base_next = nxt * channels
             for ch in range(channels):
-                interleaved.append(resampled_channels[ch][frame_idx])
-
-        return interleaved
-
-    @staticmethod
-    def _linear_resample_channel(channel_values: list[float], new_frames: int) -> list[float]:
-        """Linear interpolation helper for resampling a single channel."""
-        if new_frames <= 0:
-            return []
-
-        frames = len(channel_values)
-        if frames == 0:
-            return [0.0] * new_frames
-        if frames == 1 or new_frames == 1:
-            return [channel_values[0]] * new_frames
-
-        scale = (frames - 1) / (new_frames - 1)
-        result = []
-        for i in range(new_frames):
-            pos = i * scale
-            idx = int(pos)
-            frac = pos - idx
-            if idx >= frames - 1:
-                result.append(channel_values[-1])
-            else:
-                start = channel_values[idx]
-                end = channel_values[idx + 1]
-                result.append(start + (end - start) * frac)
-        return result
+                a = buf[base + ch]
+                b = buf[base_next + ch]
+                out.append(a + (b - a) * frac)
+        return out
 
     def _convert_dtype(self, data: bytes) -> bytes:
         """
@@ -496,8 +496,7 @@ class SystemAudioRecorder:
         """
         while self._recording or not self._audio_queue.empty():
             try:
-                chunk_data, sample_count, channels = self._audio_queue.get(timeout=timeout)
-                yield chunk_data
+                yield self._audio_queue.get(timeout=timeout)
             except queue.Empty:
                 # Timeout reached, check if still recording
                 if not self._recording:
