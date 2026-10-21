@@ -70,8 +70,8 @@ def main():
         print("\033[2J\033[?25l", end="")  # Clear screen and hide cursor
 
         for chunk in recorder.stream():
-            # Ensure chunk is 1D and add to buffer
-            chunk = chunk.flatten() if chunk.ndim == 2 else chunk
+            # Take the single channel and add it to the buffer
+            chunk = chunk[:, 0]  # mono: chunks are shaped (frames, 1)
             audio_buffer = np.concatenate([audio_buffer, chunk])
 
             # When we have enough samples, perform FFT

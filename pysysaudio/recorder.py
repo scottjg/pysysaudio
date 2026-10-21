@@ -56,6 +56,7 @@ class SystemAudioRecorder:
                 - "bytes": Raw PCM data as bytes (default, no dependencies)
                 - "numpy": NumPy array, shape (frames, channels) (requires numpy)
                 - "mlx": MLX array, shape (frames, channels) (requires mlx)
+                Arrays are always 2-D, so mono audio is shaped (frames, 1).
             dtype: Sample data type for output audio:
                 - "float32": 32-bit float in range [-1.0, 1.0] (default)
                 - "int16": 16-bit signed integer (PCM16, range [-32768, 32767])
@@ -435,42 +436,19 @@ class SystemAudioRecorder:
         # Convert to requested output format
         if self.format == "bytes":
             return data
-        elif self.format == "numpy":
-            # Determine dtype based on self.dtype
-            np_dtype = {
-                "float32": self._np.float32,
-                "int16": self._np.int16,
-                "int32": self._np.int32,
-            }[self.dtype]
 
-            array = self._np.frombuffer(data, dtype=np_dtype)
-            # Reshape to (frames, channels) for multi-channel audio
-            if channels > 1:
-                frames = sample_count // channels
-                array = array.reshape(frames, channels)
-            return array
-        elif self.format == "mlx":
-            # First to numpy, then to MLX
-            np_dtype = {
-                "float32": self._np.float32,
-                "int16": self._np.int16,
-                "int32": self._np.int32,
-            }[self.dtype]
+        # numpy and mlx are always shaped (frames, channels), mono included, so callers
+        # can index chunk[:, ch] without checking the channel count.
+        np_dtype = {
+            "float32": self._np.float32,
+            "int16": self._np.int16,
+            "int32": self._np.int32,
+        }[self.dtype]
+        array = self._np.frombuffer(data, dtype=np_dtype).reshape(-1, max(channels, 1))
 
-            np_array = self._np.frombuffer(data, dtype=np_dtype)
-
-            # Calculate actual sample count from byte length
-            bytes_per_sample = {"float32": 4, "int16": 2, "int32": 4}[self.dtype]
-            actual_sample_count = len(data) // bytes_per_sample
-
-            # Reshape to (frames, channels) for multi-channel audio
-            if channels > 1:
-                frames = actual_sample_count // channels
-                np_array = np_array.reshape(frames, channels)
-
-            return self._mx.array(np_array)
-        else:
-            return data
+        if self.format == "mlx":
+            return self._mx.array(array)
+        return array
 
     def stream(self, timeout: Optional[float] = 0.1) -> Iterator[AudioData]:
         """

@@ -166,8 +166,8 @@ SystemAudioRecorder(
 - `channels`: Number of audio channels - 1 for mono, 2 for stereo (default: 2)
 - `format`: Format for audio data yielded by `stream()` (default: "bytes")
   - `"bytes"`: Raw PCM data as bytes (no dependencies)
-  - `"numpy"`: NumPy ndarray with shape (frames, channels) (requires `numpy`)
-  - `"mlx"`: MLX array with shape (frames, channels) (requires `mlx`, Apple Silicon)
+  - `"numpy"`: NumPy ndarray with shape (frames, channels), so mono is (frames, 1) (requires `numpy`)
+  - `"mlx"`: MLX array with shape (frames, channels), so mono is (frames, 1) (requires `mlx`, Apple Silicon)
 - `dtype`: Sample data type for output audio (default: "float32")
   - `"float32"`: 32-bit float in range [-1.0, 1.0]
   - `"int16"`: 16-bit signed integer (PCM16, range [-32768, 32767])

@@ -388,5 +388,69 @@ def test_stream_ends_when_stopped_from_another_thread():
     assert all(isinstance(c, bytes) for c in chunks)
 
 
+@pytest.mark.parametrize("dtype", ["float32", "int16", "int32"])
+@pytest.mark.parametrize(
+    "out_channels,src_rate,dst_rate",
+    [
+        (1, 48000, 48000),  # mono, no resampling
+        (1, 48000, 16000),  # mono via downmix and resample
+        (2, 48000, 48000),  # stereo passthrough
+        (2, 48000, 44100),  # stereo resampled
+    ],
+)
+def test_numpy_output_is_always_2d(dtype, out_channels, src_rate, dst_rate):
+    """numpy chunks are (frames, channels) for every channel count, mono included."""
+    np = pytest.importorskip("numpy")
+    from pysysaudio import SystemAudioRecorder
+
+    recorder = SystemAudioRecorder(
+        sample_rate=dst_rate, channels=out_channels, format="numpy", dtype=dtype
+    )
+    recorder._actual_sample_rate = src_rate
+    recorder._actual_channels = 2
+
+    frames = 480
+    data = np.zeros(frames * 2, dtype=np.float32).tobytes()
+    chunk = recorder._convert_audio_data(data, frames * 2, 2)
+
+    assert chunk.ndim == 2
+    assert chunk.shape[1] == out_channels
+    assert chunk.dtype == np.dtype(dtype)
+    assert abs(chunk.shape[0] - frames * dst_rate / src_rate) <= 1
+
+
+def test_numpy_mono_capture_without_conversion_is_2d():
+    """A mono capture delivered as mono must still come back as (frames, 1)."""
+    np = pytest.importorskip("numpy")
+    from pysysaudio import SystemAudioRecorder
+
+    recorder = SystemAudioRecorder(sample_rate=48000, channels=1, format="numpy")
+    recorder._actual_sample_rate = 48000
+    recorder._actual_channels = 1
+
+    data = np.arange(5, dtype=np.float32).tobytes()
+    chunk = recorder._convert_audio_data(data, 5, 1)
+
+    assert chunk.shape == (5, 1)
+    assert chunk[:, 0].tolist() == [0.0, 1.0, 2.0, 3.0, 4.0]
+
+
+@pytest.mark.parametrize("out_channels", [1, 2])
+def test_mlx_output_is_always_2d(out_channels):
+    """mlx chunks share the numpy shape contract."""
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("mlx.core")
+    from pysysaudio import SystemAudioRecorder
+
+    recorder = SystemAudioRecorder(sample_rate=48000, channels=out_channels, format="mlx")
+    recorder._actual_sample_rate = 48000
+    recorder._actual_channels = 2
+
+    data = np.zeros(960, dtype=np.float32).tobytes()
+    chunk = recorder._convert_audio_data(data, 960, 2)
+
+    assert tuple(chunk.shape) == (480, out_channels)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
