@@ -5,7 +5,7 @@ A Python library for recording system audio on **macOS** and **Windows**.
 ## Features
 
 - 🎵 Record system audio (all sounds playing on your system)
-- 🪟 **Cross-platform**: macOS (ScreenCaptureKit) and Windows (WASAPI)
+- 🪟 **Cross-platform**: macOS (CoreAudio process taps) and Windows (WASAPI)
 - 🎚️ Configurable sample rate and channel count
 - 🔧 Configurable output formats: bytes, NumPy, or MLX arrays
 - 🎛️ Automatic resampling and channel remixing with each platform's native resampler, for both streams and WAV files
@@ -13,9 +13,9 @@ A Python library for recording system audio on **macOS** and **Windows**.
 ## Requirements
 
 ### macOS
-- macOS 14.2 (Ventura) or later
+- macOS 14.2 (Sonoma) or later
 - Python 3.9+
-- Screen Recording permission (macOS will prompt on first use)
+- System audio recording permission (macOS will prompt on first use)
 
 ### Windows
 - Windows 10 or later
@@ -38,7 +38,7 @@ Pre-built wheels are available for:
 ### From Source
 
 ```bash
-git clone https://github.com/yourusername/pysysaudio.git
+git clone https://github.com/scottjg/pysysaudio.git
 cd pysysaudio
 pip install .
 ```
@@ -137,11 +137,11 @@ recorder.stop_recording()
 ```python
 from pysysaudio import SystemAudioRecorder
 
-# Check if Screen Recording permission is granted
+# Check if system audio recording permission is granted
 if SystemAudioRecorder.check_permission():
     print("Permission granted!")
 else:
-    print("Please grant Screen Recording permission in System Settings")
+    print("Please grant system audio recording permission in System Settings")
 ```
 
 ## API Reference
@@ -221,7 +221,7 @@ Frames of captured audio discarded because `stream()` fell more than `buffer_sec
 
 ##### `check_permission() -> bool` (static)
 
-Check if Screen Recording permission has been granted.
+Check if system audio recording permission has been granted.
 
 Returns `True` if permission is granted, `False` otherwise.
 
