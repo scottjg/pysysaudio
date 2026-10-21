@@ -1,7 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <pybind11/functional.h>
 #include "audio_recorder.h"
+#include <vector>
 
 namespace py = pybind11;
 using namespace pysysaudio;
@@ -13,43 +13,56 @@ PYBIND11_MODULE(_pysysaudio_native, m) {
     m.doc() = "Native audio recording module using CoreAudio taps (macOS)";
 #endif
 
-    // AudioRecorder class
+    // The capture thread never touches Python. Samples flow through a native
+    // queue, and read() below blocks with the GIL released until some arrive.
     py::class_<AudioRecorder>(m, "AudioRecorder")
-        .def(py::init<const std::string&, int, int>(),
+        .def(py::init<const std::string&, double>(),
              py::arg("output_path"),
-             py::arg("sample_rate") = 48000,
-             py::arg("channels") = 2,
-             "Create an audio recorder instance")
-        .def("start", &AudioRecorder::start,
-             "Start recording system audio to file")
-        .def("start_with_callback", 
-             [](AudioRecorder& self, py::function callback) {
-                 // Wrap Python callback in C++ lambda
-                 self.start_with_callback([callback](const float* samples, size_t sample_count, int channels, double sample_rate) {
-                     // Convert float* to Python bytes
-                     py::gil_scoped_acquire acquire;
-                     py::bytes data(reinterpret_cast<const char*>(samples), sample_count * sizeof(float));
-                     callback(data, sample_count, channels, sample_rate);
-                 });
-             },
-             py::arg("callback"),
-             "Start recording with a callback function that receives (bytes, sample_count, channels, sample_rate)")
-        .def("stop", 
+             py::arg("buffer_seconds") = 2.0,
+             "Create an audio recorder. output_path may be empty for streaming only; "
+             "buffer_seconds is how much audio read() may fall behind before chunks are dropped")
+        .def("start",
              [](AudioRecorder& self) {
-                 // Release GIL while stopping to avoid deadlock with callback thread
+                 py::gil_scoped_release release;
+                 self.start();
+             },
+             "Start capturing system audio")
+        .def("stop",
+             [](AudioRecorder& self) {
+                 // Release the GIL so a thread blocked in read() can wake and finish.
                  py::gil_scoped_release release;
                  return self.stop();
              },
-             "Stop recording and return the output file path")
+             "Stop capturing and return the output file path")
         .def("is_recording", &AudioRecorder::is_recording,
              "Check if currently recording")
-        .def_static("check_screen_recording_permission", 
+        .def("sample_rate", &AudioRecorder::sample_rate,
+             "Sample rate of the captured audio (valid after start)")
+        .def("channels", &AudioRecorder::channels,
+             "Channel count of the captured audio (valid after start)")
+        .def("dropped_frames", &AudioRecorder::dropped_frames,
+             "Frames discarded because read() did not keep up with capture")
+        .def("read",
+             [](AudioRecorder& self, size_t max_frames, double timeout_seconds) {
+                 std::vector<float> samples;
+                 {
+                     py::gil_scoped_release release;
+                     self.read(samples, max_frames, timeout_seconds);
+                 }
+                 return py::bytes(reinterpret_cast<const char*>(samples.data()),
+                                  samples.size() * sizeof(float));
+             },
+             py::arg("max_frames"),
+             py::arg("timeout_seconds") = -1.0,
+             "Read up to max_frames frames of interleaved float32 samples as bytes. Blocks "
+             "until data is available, the recorder stops, or the timeout passes (negative "
+             "waits indefinitely). Returns empty bytes on timeout or once stopped and drained")
+        .def_static("check_screen_recording_permission",
                     &AudioRecorder::check_screen_recording_permission,
-                    "Check if the current macOS runtime supports system capture");
+                    "Check if the current runtime supports system capture");
 
     // Standalone function for checking permission
-    m.def("check_screen_recording_permission", 
+    m.def("check_screen_recording_permission",
           &AudioRecorder::check_screen_recording_permission,
-          "Check if the current macOS runtime supports system capture");
+          "Check if the current runtime supports system capture");
 }
-

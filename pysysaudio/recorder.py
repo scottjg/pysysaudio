@@ -4,7 +4,7 @@ High-level Python interface for system audio recording.
 
 import threading
 import struct
-import queue
+import warnings
 from array import array
 from typing import Optional, Iterator, Literal, Union, Any
 from pathlib import Path
@@ -21,6 +21,13 @@ class SystemAudioRecorder:
         - macOS: Uses CoreAudio process taps (requires macOS 14.2+)
         - Windows: Uses WASAPI loopback capture
 
+    Threading model:
+        The platform capture thread never runs Python. It pushes float32 samples
+        into a native queue; stream() pulls from that queue and does all format
+        conversion on the calling thread. Heavy work inside a stream() loop can
+        therefore never stall capture. If the loop falls more than buffer_seconds
+        behind, capture drops chunks and dropped_frames counts them.
+
     Example:
         recorder = SystemAudioRecorder()
         recorder.start_recording("output.wav")
@@ -36,7 +43,8 @@ class SystemAudioRecorder:
         channels: int = 2,
         format: Literal["bytes", "numpy", "mlx"] = "bytes",
         dtype: Literal["float32", "int16", "int32"] = "float32",
-        buffer_size: int = 100,
+        buffer_seconds: float = 2.0,
+        buffer_size: Optional[int] = None,
     ):
         """
         Initialize the system audio recorder.
@@ -54,23 +62,31 @@ class SystemAudioRecorder:
                 - "int32": 32-bit signed integer (PCM32)
                 Note: dtype conversion for format="bytes" uses standard library (no numpy needed).
                       For format="numpy"/"mlx", numpy is used for better performance.
-            buffer_size: Maximum number of audio chunks to buffer (default: 100)
+            buffer_seconds: How much captured audio to hold between the capture thread and
+                stream() before chunks are dropped (default: 2.0). See dropped_frames.
+            buffer_size: Deprecated and ignored. Use buffer_seconds.
 
         Note:
             Audio is automatically resampled/remixed to match the requested sample_rate
             and channels when the system provides different settings.
         """
+        if buffer_size is not None:
+            warnings.warn(
+                "buffer_size is deprecated and has no effect; use buffer_seconds instead",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self.sample_rate = sample_rate
         self.channels = channels
         self.format = format
         self.dtype = dtype
+        self.buffer_seconds = buffer_seconds
         self._recording = False
         self._native_recorder = None
         self._lock = threading.Lock()
-        self._audio_queue = queue.Queue(maxsize=buffer_size)
-        self._stream_active = False
-        self._actual_sample_rate = None  # Detected from system
-        self._actual_channels = None  # Detected from first callback
+        self._actual_sample_rate = None  # Detected from the capture backend at start
+        self._actual_channels = None
+        self._dropped_frames = 0  # Final count from the last recording
         self._reset_resampler_state()
 
         # Validate format and check dependencies
@@ -122,55 +138,39 @@ class SystemAudioRecorder:
             if self._recording:
                 raise RuntimeError("Recording is already in progress")
 
-            # Reset actual rate/channels for new recording session
-            self._actual_sample_rate = None
-            self._actual_channels = None
-            self._reset_resampler_state()
-
-            # Import the native module
             try:
                 from . import _pysysaudio_native
-
-                self._native_recorder = _pysysaudio_native.AudioRecorder(
-                    output_path or "", self.sample_rate, self.channels  # Empty string if None
-                )
             except ImportError as e:
                 raise RuntimeError(
                     "Native audio recording module not available. "
                     "Make sure pysysaudio is properly installed with native extensions."
                 ) from e
 
-            # Always use callback internally to populate the queue
-            wrapped_callback = self._internal_callback
-            self._native_recorder.start_with_callback(wrapped_callback)
+            # Reset per-recording state
+            self._actual_sample_rate = None
+            self._actual_channels = None
+            self._dropped_frames = 0
+            self._reset_resampler_state()
+
+            native = _pysysaudio_native.AudioRecorder(output_path or "", self.buffer_seconds)
+            native.start()
+
+            # The capture format is known as soon as capture starts.
+            self._actual_sample_rate = int(native.sample_rate())
+            self._actual_channels = int(native.channels())
+
+            needs_resample = (
+                self._actual_channels != self.channels
+                or self._actual_sample_rate != self.sample_rate
+            )
+            if needs_resample and self._np is None and self.format != "bytes":
+                native.stop()
+                raise ImportError(
+                    "Automatic resampling requires numpy. Install with: pip install numpy"
+                )
+
+            self._native_recorder = native
             self._recording = True
-            self._stream_active = True
-
-    def _internal_callback(self, data: bytes, sample_count: int, channels: int, sample_rate: float):
-        """Internal callback that receives audio data from native layer and queues it."""
-        if not self._stream_active:
-            return
-
-        # Track actual format from first callback
-        if self._actual_channels is None:
-            self._actual_channels = channels
-            self._actual_sample_rate = int(
-                sample_rate
-            )  # Get actual sample rate from native capture backend
-
-        # Convert data to requested format (includes resampling if needed)
-        converted_data = self._convert_audio_data(data, sample_count, channels)
-        if len(converted_data) == 0:
-            # A chunk can resample to nothing when the input is tiny; nothing to deliver.
-            return
-
-        try:
-            # Non-blocking put - if queue is full, drop the chunk
-            self._audio_queue.put_nowait(converted_data)
-        except queue.Full:
-            # Queue is full, drop this chunk
-            # This prevents blocking the audio recording thread
-            pass
 
     def _reset_resampler_state(self) -> None:
         """Forget the carried-over frame and read position from a previous recording."""
@@ -476,10 +476,14 @@ class SystemAudioRecorder:
         """
         Generator that yields audio chunks as they are recorded.
 
+        Chunks are read from the native capture queue and converted on the calling
+        thread, so processing in the loop body never stalls capture. If the loop
+        falls more than buffer_seconds behind, chunks are dropped; see dropped_frames.
+
         Args:
             timeout: Timeout in seconds for waiting for new chunks (default: 0.1).
-                    None means wait indefinitely. Use a small timeout to allow
-                    checking if recording has stopped.
+                    None means wait indefinitely. The generator ends once recording
+                    has stopped and the remaining chunks have been drained.
 
         Yields:
             Audio data in the format specified during initialization (bytes, numpy, or mlx array)
@@ -494,18 +498,31 @@ class SystemAudioRecorder:
                     break
             recorder.stop_recording()
         """
-        while self._recording or not self._audio_queue.empty():
-            try:
-                yield self._audio_queue.get(timeout=timeout)
-            except queue.Empty:
-                # Timeout reached, check if still recording
-                if not self._recording:
-                    break
-                continue
+        native = self._native_recorder
+        if native is None:
+            return
+
+        wait = -1.0 if timeout is None else float(timeout)
+        channels = self._actual_channels or 1
+        # Cap a single read at one second so a consumer that fell behind catches
+        # up in bounded pieces rather than one huge chunk.
+        max_frames = max(self._actual_sample_rate or 48000, 1)
+
+        while True:
+            data = native.read(max_frames, wait)
+            if data:
+                yield self._convert_audio_data(data, len(data) // 4, channels)
+            elif not native.is_recording():
+                # Stopped, and everything that was queued has been delivered.
+                break
+            # Otherwise the wait timed out while capture is still running; keep waiting.
 
     def stop_recording(self) -> Optional[str]:
         """
         Stop recording and finalize the audio file.
+
+        A stream() loop running in another thread wakes up, drains what is left
+        in the queue, and ends.
 
         Returns:
             Path to the recorded audio file, or empty string if no file was created
@@ -514,8 +531,9 @@ class SystemAudioRecorder:
             if not self._recording:
                 raise RuntimeError("No recording in progress")
 
-            self._stream_active = False  # Stop accepting new chunks
-            output_path = self._native_recorder.stop()
+            native = self._native_recorder
+            output_path = native.stop()
+            self._dropped_frames = int(native.dropped_frames())
             self._recording = False
             self._native_recorder = None
 
@@ -524,6 +542,19 @@ class SystemAudioRecorder:
     def is_recording(self) -> bool:
         """Check if recording is currently in progress."""
         return self._recording
+
+    @property
+    def dropped_frames(self) -> int:
+        """
+        Frames of captured audio discarded because stream() fell behind.
+
+        Counted at the capture sample rate. Resets on each start_recording();
+        after stop_recording() it holds the final count for the last recording.
+        """
+        native = self._native_recorder
+        if native is not None:
+            return int(native.dropped_frames())
+        return self._dropped_frames
 
     @staticmethod
     def check_permission() -> bool:

@@ -8,6 +8,8 @@ import os
 import struct
 import platform
 import sys
+import threading
+import time
 from pathlib import Path
 
 
@@ -317,6 +319,73 @@ def test_resampler_state_resets_between_recordings():
     recorder._reset_resampler_state()
     assert recorder._resample_prev is None
     assert recorder._resample_phase_num == 0
+
+
+def test_buffer_size_is_deprecated():
+    """The old chunk-count parameter is accepted but warns."""
+    from pysysaudio import SystemAudioRecorder
+
+    with pytest.warns(DeprecationWarning):
+        recorder = SystemAudioRecorder(buffer_size=10)
+    assert recorder.buffer_seconds == 2.0
+
+
+def test_dropped_frames_before_recording():
+    from pysysaudio import SystemAudioRecorder
+
+    assert SystemAudioRecorder().dropped_frames == 0
+
+
+@pytest.mark.skipif(
+    not _macos_supports_coreaudio_taps(),
+    reason="CoreAudio process taps require macOS 14.2+",
+)
+def test_stream_end_to_end():
+    """Capture briefly and check stream() delivers converted audio without drops."""
+    from pysysaudio import SystemAudioRecorder
+
+    recorder = SystemAudioRecorder(sample_rate=16000, channels=1, format="bytes", dtype="int16")
+    recorder.start_recording()
+    try:
+        # Capture format is known as soon as recording starts.
+        assert recorder._actual_sample_rate > 0
+        assert recorder._actual_channels > 0
+
+        deadline = time.monotonic() + 0.5
+        total_frames = 0
+        for chunk in recorder.stream():
+            assert isinstance(chunk, bytes)
+            assert len(chunk) % 2 == 0  # whole int16 mono frames
+            total_frames += len(chunk) // 2
+            if time.monotonic() >= deadline:
+                break
+    finally:
+        recorder.stop_recording()
+
+    # At least half of the 0.5 s of 16 kHz audio should have arrived.
+    assert total_frames >= 4000
+    assert recorder.dropped_frames == 0
+
+
+@pytest.mark.skipif(
+    not _macos_supports_coreaudio_taps(),
+    reason="CoreAudio process taps require macOS 14.2+",
+)
+def test_stream_ends_when_stopped_from_another_thread():
+    """A stream() loop blocked with no timeout must wake and finish on stop."""
+    from pysysaudio import SystemAudioRecorder
+
+    recorder = SystemAudioRecorder()
+    recorder.start_recording()
+    threading.Timer(0.3, recorder.stop_recording).start()
+
+    started = time.monotonic()
+    chunks = list(recorder.stream(timeout=None))
+    elapsed = time.monotonic() - started
+
+    assert not recorder.is_recording()
+    assert elapsed < 3.0
+    assert all(isinstance(c, bytes) for c in chunks)
 
 
 if __name__ == "__main__":

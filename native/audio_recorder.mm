@@ -6,6 +6,7 @@
 #import <AudioToolbox/AudioToolbox.h>
 
 #include "audio_recorder.h"
+#include "ring_buffer.h"
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -26,22 +27,23 @@ inline void throw_osstatus(const std::string& prefix, OSStatus status) {
     throw std::runtime_error(prefix + " (OSStatus=" + std::to_string(status) + ")");
 }
 
+constexpr double kFallbackSampleRate = 48000.0;
+constexpr UInt32 kFallbackChannels = 2;
+
 }  // namespace
 
 namespace pysysaudio {
 
 class AudioRecorder::Impl {
 public:
-    Impl(const std::string& output_path, int sample_rate, int channels)
+    Impl(const std::string& output_path, double buffer_seconds)
         : output_path_(output_path),
-          requested_sample_rate_(sample_rate),
-          requested_channels_(channels),
+          buffer_seconds_(buffer_seconds > 0.0 ? buffer_seconds : 2.0),
           is_recording_(false),
           tap_id_(kAudioObjectUnknown),
           aggregate_device_id_(kAudioObjectUnknown),
           io_proc_id_(nullptr),
-          audio_file_(nullptr),
-          callback_(nullptr) {
+          audio_file_(nullptr) {
         std::memset(&tap_format_, 0, sizeof(tap_format_));
         // Reserve a large buffer (~256KB) to avoid real-time reallocation.
         // 65536 frames * 1 channel * 4 bytes = 256KB.
@@ -61,43 +63,7 @@ public:
         cleanup_device_and_tap();
     }
 
-    void start() { start_internal(nullptr); }
-
-    void start_with_callback(AudioCallback callback) { start_internal(callback); }
-
-    std::string stop() {
-        if (!is_recording_.load(std::memory_order_relaxed)) {
-            throw std::runtime_error("Not currently recording");
-        }
-
-        // AudioDeviceStop is synchronous — IOProc will not fire after it returns.
-        if (aggregate_device_id_ != kAudioObjectUnknown && io_proc_id_ != nullptr) {
-            AudioDeviceStop(aggregate_device_id_, io_proc_id_);
-            AudioDeviceDestroyIOProcID(aggregate_device_id_, io_proc_id_);
-            io_proc_id_ = nullptr;
-        }
-
-        cleanup_audio_file();
-        cleanup_device_and_tap();
-        is_recording_.store(false, std::memory_order_relaxed);
-        return output_path_;
-    }
-
-    bool is_recording() const { return is_recording_.load(std::memory_order_relaxed); }
-
-private:
-    static OSStatus io_proc(AudioObjectID,
-                            const AudioTimeStamp*,
-                            const AudioBufferList* inInputData,
-                            const AudioTimeStamp*,
-                            AudioBufferList*,
-                            const AudioTimeStamp*,
-                            void* inClientData) noexcept {
-        auto* impl = static_cast<Impl*>(inClientData);
-        return impl ? impl->handle_io(inInputData) : kAudioHardwareNoError;
-    }
-
-    void start_internal(AudioCallback callback) {
+    void start() {
         if (is_recording_.load(std::memory_order_relaxed)) {
             throw std::runtime_error("Already recording");
         }
@@ -107,12 +73,16 @@ private:
             throw std::runtime_error("macOS 14.2 or later is required for CoreAudio taps");
         }
 
-        callback_ = callback;
-
         @autoreleasepool {
             create_tap_and_aggregate_device();
             configure_output_file_if_needed();
         }
+
+        // Size the queue for the capture format now that it is known. This is the
+        // only allocation on the capture path and it happens before capture starts.
+        const size_t capacity = static_cast<size_t>(
+            buffer_seconds_ * tap_format_.mSampleRate * tap_format_.mChannelsPerFrame);
+        queue_.reset(capacity);
 
         OSStatus status = AudioDeviceCreateIOProcID(
             aggregate_device_id_, &Impl::io_proc, this, &io_proc_id_);
@@ -134,6 +104,55 @@ private:
             cleanup_device_and_tap();
             throw_osstatus("Failed to start CoreAudio tap device", status);
         }
+    }
+
+    std::string stop() {
+        if (!is_recording_.load(std::memory_order_relaxed)) {
+            throw std::runtime_error("Not currently recording");
+        }
+
+        // AudioDeviceStop is synchronous — IOProc will not fire after it returns.
+        if (aggregate_device_id_ != kAudioObjectUnknown && io_proc_id_ != nullptr) {
+            AudioDeviceStop(aggregate_device_id_, io_proc_id_);
+            AudioDeviceDestroyIOProcID(aggregate_device_id_, io_proc_id_);
+            io_proc_id_ = nullptr;
+        }
+
+        cleanup_audio_file();
+        cleanup_device_and_tap();
+        is_recording_.store(false, std::memory_order_relaxed);
+
+        // Wake any blocked reader. What is still queued can be drained afterwards.
+        queue_.close();
+        return output_path_;
+    }
+
+    bool is_recording() const { return is_recording_.load(std::memory_order_relaxed); }
+
+    double sample_rate() const { return tap_format_.mSampleRate; }
+
+    int channels() const { return static_cast<int>(tap_format_.mChannelsPerFrame); }
+
+    void read(std::vector<float>& out, size_t max_frames, double timeout_seconds) {
+        const size_t channels = tap_format_.mChannelsPerFrame > 0 ? tap_format_.mChannelsPerFrame : 1;
+        queue_.wait_and_pop(out, max_frames * channels, timeout_seconds);
+    }
+
+    size_t dropped_frames() const {
+        const size_t channels = tap_format_.mChannelsPerFrame > 0 ? tap_format_.mChannelsPerFrame : 1;
+        return queue_.dropped() / channels;
+    }
+
+private:
+    static OSStatus io_proc(AudioObjectID,
+                            const AudioTimeStamp*,
+                            const AudioBufferList* inInputData,
+                            const AudioTimeStamp*,
+                            AudioBufferList*,
+                            const AudioTimeStamp*,
+                            void* inClientData) noexcept {
+        auto* impl = static_cast<Impl*>(inClientData);
+        return impl ? impl->handle_io(inInputData) : kAudioHardwareNoError;
     }
 
     void create_tap_and_aggregate_device() {
@@ -192,9 +211,8 @@ private:
             tap_format_.mFormatID = kAudioFormatLinearPCM;
             tap_format_.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagsNativeEndian |
                                        kAudioFormatFlagIsPacked;
-            tap_format_.mSampleRate = requested_sample_rate_ > 0 ? requested_sample_rate_ : 48000;
-            tap_format_.mChannelsPerFrame =
-                requested_channels_ > 0 ? static_cast<UInt32>(requested_channels_) : 2;
+            tap_format_.mSampleRate = kFallbackSampleRate;
+            tap_format_.mChannelsPerFrame = kFallbackChannels;
             tap_format_.mBitsPerChannel = 32;
             tap_format_.mFramesPerPacket = 1;
             tap_format_.mBytesPerFrame = tap_format_.mChannelsPerFrame * sizeof(float);
@@ -250,6 +268,10 @@ private:
             cleanup_audio_file();
             throw_osstatus("Failed to configure output WAV client format", status);
         }
+
+        // Prime the asynchronous writer. Its first call allocates its internal
+        // buffers and thread, which must not happen on the real-time IOProc.
+        ExtAudioFileWriteAsync(audio_file_, 0, nullptr);
     }
 
     OSStatus handle_io(const AudioBufferList* input_data) noexcept {
@@ -264,10 +286,8 @@ private:
             return noErr;
         }
 
-        if (callback_) {
-            callback_(
-                io_buffer_.data(), io_buffer_.size(), static_cast<int>(channels), tap_format_.mSampleRate);
-        }
+        // Hand the samples to the consumer. No Python runs on this thread.
+        queue_.push(io_buffer_.data(), io_buffer_.size());
 
         if (audio_file_ != nullptr && frames > 0) {
             AudioBufferList list;
@@ -315,21 +335,21 @@ private:
 
             out_channels = channels_in_buffer;
             out_frames = buffer.mDataByteSize / (bytes_per_sample * out_channels);
-            out_samples.resize(static_cast<size_t>(out_frames) * out_channels);
+            const size_t total = static_cast<size_t>(out_frames) * out_channels;
+            out_samples.resize(total);
 
             const uint8_t* data = static_cast<const uint8_t*>(buffer.mData);
-            for (UInt32 frame = 0; frame < out_frames; ++frame) {
-                for (UInt32 ch = 0; ch < out_channels; ++ch) {
-                    const size_t idx = static_cast<size_t>(frame) * out_channels + ch;
-                    const uint8_t* sample_ptr = data + idx * bytes_per_sample;
-                    out_samples[idx] = sample_to_float(sample_ptr, is_float, is_signed_int, bits);
-                }
+            if (is_float && bits == 32) {
+                // The common case: already interleaved float32, so a straight copy.
+                std::memcpy(out_samples.data(), data, total * sizeof(float));
+                return true;
+            }
+
+            for (size_t idx = 0; idx < total; ++idx) {
+                out_samples[idx] =
+                    sample_to_float(data + idx * bytes_per_sample, is_float, is_signed_int, bits);
             }
             return true;
-        }
-
-        if (input_data->mNumberBuffers == 0) {
-            return false;
         }
 
         out_channels = std::min(out_channels, input_data->mNumberBuffers);
@@ -402,32 +422,37 @@ private:
     }
 
     std::string output_path_;
-    int requested_sample_rate_;
-    int requested_channels_;
+    double buffer_seconds_;
     std::atomic<bool> is_recording_;
     AudioObjectID tap_id_;
     AudioObjectID aggregate_device_id_;
     AudioDeviceIOProcID io_proc_id_;
     ExtAudioFileRef audio_file_;
     AudioStreamBasicDescription tap_format_;
-    AudioCallback callback_;
+    SampleQueue queue_;
     std::vector<float> io_buffer_;  // Pre-allocated; only touched from IOProc.
 };
 
-AudioRecorder::AudioRecorder(const std::string& output_path, int sample_rate, int channels)
-    : pImpl(std::make_unique<Impl>(output_path, sample_rate, channels)) {}
+AudioRecorder::AudioRecorder(const std::string& output_path, double buffer_seconds)
+    : pImpl(std::make_unique<Impl>(output_path, buffer_seconds)) {}
 
 AudioRecorder::~AudioRecorder() = default;
 
 void AudioRecorder::start() { pImpl->start(); }
 
-void AudioRecorder::start_with_callback(AudioCallback callback) {
-    pImpl->start_with_callback(callback);
-}
-
 std::string AudioRecorder::stop() { return pImpl->stop(); }
 
 bool AudioRecorder::is_recording() const { return pImpl->is_recording(); }
+
+double AudioRecorder::sample_rate() const { return pImpl->sample_rate(); }
+
+int AudioRecorder::channels() const { return pImpl->channels(); }
+
+void AudioRecorder::read(std::vector<float>& out, size_t max_frames, double timeout_seconds) {
+    pImpl->read(out, max_frames, timeout_seconds);
+}
+
+size_t AudioRecorder::dropped_frames() const { return pImpl->dropped_frames(); }
 
 bool AudioRecorder::check_screen_recording_permission() {
     // Kept for API compatibility with existing Python wrappers.

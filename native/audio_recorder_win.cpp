@@ -1,6 +1,7 @@
 #ifdef _WIN32
 
 #include "audio_recorder.h"
+#include "ring_buffer.h"
 #include <iostream>
 #include <vector>
 #include <thread>
@@ -40,13 +41,11 @@ namespace pysysaudio {
 
 class AudioRecorder::Impl {
 public:
-    Impl(const std::string& output_path, int sample_rate, int channels)
+    Impl(const std::string& output_path, double buffer_seconds)
         : output_path_(output_path)
-        , sample_rate_(sample_rate)
-        , channels_(channels)
+        , buffer_seconds_(buffer_seconds > 0.0 ? buffer_seconds : 2.0)
         , is_recording_(false)
         , capture_thread_(nullptr)
-        , callback_(nullptr)
         , pEnumerator_(nullptr)
         , pDevice_(nullptr)
         , pAudioClient_(nullptr)
@@ -80,19 +79,9 @@ public:
     }
     
     void start() {
-        start_internal(nullptr);
-    }
-    
-    void start_with_callback(AudioCallback callback) {
-        start_internal(callback);
-    }
-    
-    void start_internal(AudioCallback callback) {
         if (is_recording_) {
             throw std::runtime_error("Already recording");
         }
-        
-        callback_ = callback;
         
         HRESULT hr;
         
@@ -139,6 +128,11 @@ public:
         // Store the actual format we're capturing
         actual_sample_rate_ = pwfx->nSamplesPerSec;
         actual_channels_ = pwfx->nChannels;
+        
+        // Size the queue for the capture format. This allocation happens here,
+        // before the capture thread exists, never on the capture path.
+        queue_.reset(static_cast<size_t>(
+            buffer_seconds_ * actual_sample_rate_ * actual_channels_));
         
         // Optional: Uncomment for debugging audio format issues
         // std::cout << "WASAPI: " << actual_sample_rate_ << " Hz, " 
@@ -288,11 +282,32 @@ public:
         
         cleanup_resources();
         
+        // Wake any blocked reader. What is still queued can be drained afterwards.
+        queue_.close();
+        
         return output_path_;
     }
     
     bool is_recording() const {
         return is_recording_;
+    }
+    
+    double sample_rate() const {
+        return static_cast<double>(actual_sample_rate_);
+    }
+    
+    int channels() const {
+        return actual_channels_;
+    }
+    
+    void read(std::vector<float>& out, size_t max_frames, double timeout_seconds) {
+        const size_t channels = actual_channels_ > 0 ? static_cast<size_t>(actual_channels_) : 1;
+        queue_.wait_and_pop(out, max_frames * channels, timeout_seconds);
+    }
+    
+    size_t dropped_frames() const {
+        const size_t channels = actual_channels_ > 0 ? static_cast<size_t>(actual_channels_) : 1;
+        return queue_.dropped() / channels;
     }
     
 private:
@@ -447,7 +462,7 @@ private:
                     }
                     
                     if (pData || (flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
-                        // Process the audio data (this calls the Python callback)
+                        // Process the audio data (converts to float32 and queues it)
                         process_audio_data(pData, numFramesAvailable, format, is_float, 
                                          flags & AUDCLNT_BUFFERFLAGS_SILENT);
                         total_chunks++;
@@ -474,7 +489,7 @@ private:
         
         size_t total_samples = numFrames * actual_channels_;
         
-        // Convert to float32 for callback
+        // Convert to float32 for the queue
         std::vector<float> float_samples(total_samples);
         
         if (is_silent) {
@@ -500,9 +515,9 @@ private:
             }
         }
         
-        // Call Python callback if provided (check again in case stop was called during conversion)
-        if (callback_ && is_recording_) {
-            callback_(float_samples.data(), total_samples, actual_channels_, actual_sample_rate_);
+        // Hand the samples to the consumer. No Python runs on this thread.
+        if (is_recording_) {
+            queue_.push(float_samples.data(), total_samples);
         }
         
         // Write to WAV file if open
@@ -526,11 +541,10 @@ private:
     }
     
     std::string output_path_;
-    int sample_rate_;
-    int channels_;
+    double buffer_seconds_;
     std::atomic<bool> is_recording_;
     std::thread* capture_thread_;
-    AudioCallback callback_;
+    SampleQueue queue_;
     
     // Windows Audio API objects
     IMMDeviceEnumerator* pEnumerator_;
@@ -548,15 +562,15 @@ private:
     uint32_t bytes_recorded_;
     
     // Actual format info
-    int actual_sample_rate_;
-    int actual_channels_;
+    int actual_sample_rate_ = 0;
+    int actual_channels_ = 0;
     
     bool com_initialized_;
 };
 
 // AudioRecorder implementation
-AudioRecorder::AudioRecorder(const std::string& output_path, int sample_rate, int channels)
-    : pImpl(std::make_unique<Impl>(output_path, sample_rate, channels)) {
+AudioRecorder::AudioRecorder(const std::string& output_path, double buffer_seconds)
+    : pImpl(std::make_unique<Impl>(output_path, buffer_seconds)) {
 }
 
 AudioRecorder::~AudioRecorder() = default;
@@ -565,16 +579,28 @@ void AudioRecorder::start() {
     pImpl->start();
 }
 
-void AudioRecorder::start_with_callback(AudioCallback callback) {
-    pImpl->start_with_callback(callback);
-}
-
 std::string AudioRecorder::stop() {
     return pImpl->stop();
 }
 
 bool AudioRecorder::is_recording() const {
     return pImpl->is_recording();
+}
+
+double AudioRecorder::sample_rate() const {
+    return pImpl->sample_rate();
+}
+
+int AudioRecorder::channels() const {
+    return pImpl->channels();
+}
+
+void AudioRecorder::read(std::vector<float>& out, size_t max_frames, double timeout_seconds) {
+    pImpl->read(out, max_frames, timeout_seconds);
+}
+
+size_t AudioRecorder::dropped_frames() const {
+    return pImpl->dropped_frames();
 }
 
 bool AudioRecorder::check_screen_recording_permission() {

@@ -158,7 +158,7 @@ SystemAudioRecorder(
     channels: int = 2,
     format: Literal["bytes", "numpy", "mlx"] = "bytes",
     dtype: Literal["float32", "int16", "int32"] = "float32",
-    buffer_size: int = 100
+    buffer_seconds: float = 2.0
 )
 ```
 
@@ -172,7 +172,7 @@ SystemAudioRecorder(
   - `"float32"`: 32-bit float in range [-1.0, 1.0]
   - `"int16"`: 16-bit signed integer (PCM16, range [-32768, 32767])
   - `"int32"`: 32-bit signed integer (PCM32)
-- `buffer_size`: Maximum number of audio chunks to buffer (default: 100)
+- `buffer_seconds`: How much captured audio to hold between the capture thread and `stream()` before chunks are dropped (default: 2.0)
 
 #### Methods
 
@@ -191,6 +191,8 @@ Generator that yields audio chunks as they are recorded.
 - `timeout`: Timeout in seconds for waiting for new chunks (default: 0.1). `None` means wait indefinitely.
 
 **Returns**: Iterator yielding audio data in the format specified during initialization (bytes, numpy array, or mlx array).
+
+Chunks are read from a native capture queue and converted on the calling thread. The platform's audio thread never runs Python, so heavy processing inside the loop cannot stall capture. If the loop falls more than `buffer_seconds` behind, chunks are dropped and `dropped_frames` counts them. The generator ends once recording has stopped and the remaining chunks have been drained.
 
 **Example**:
 ```python
@@ -212,6 +214,10 @@ Returns the path to the saved audio file, or empty string if no file was created
 ##### `is_recording() -> bool`
 
 Check if recording is currently in progress.
+
+##### `dropped_frames -> int` (property)
+
+Frames of captured audio discarded because `stream()` fell more than `buffer_seconds` behind. Counted at the capture sample rate. Resets on each `start_recording()`; after `stop_recording()` it holds the final count for the last recording.
 
 ##### `check_permission() -> bool` (static)
 
