@@ -1,11 +1,19 @@
 name: Build
 
+# Builds wheels and the sdist. Runs on its own for pushes and pull requests,
+# and is called by publish.yml so releases are built by exactly the same jobs.
+# cibuildwheel reads its settings from [tool.cibuildwheel] in pyproject.toml.
+
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   build_wheels:
@@ -21,24 +29,6 @@ jobs:
 
       - name: Build wheels
         uses: pypa/cibuildwheel@v4.3.3
-        env:
-          # Build for Python 3.9 through 3.13
-          CIBW_BUILD: cp39-* cp310-* cp311-* cp312-* cp313-*
-          # Skip 32-bit builds and all Linux builds (Linux not supported)
-          CIBW_SKIP: "*-win32 *-manylinux* *-musllinux_*"
-          # macOS: Only build for macOS 14.2+, universal2 and arm64
-          CIBW_ARCHS_MACOS: "x86_64 arm64 universal2"
-          CIBW_ENVIRONMENT_MACOS: MACOSX_DEPLOYMENT_TARGET=14.2
-          # Windows: Build for amd64 only
-          CIBW_ARCHS_WINDOWS: "AMD64"
-          # Install test dependencies
-          CIBW_TEST_REQUIRES: pytest
-          # Run tests (skip on macOS due to permission requirements)
-          CIBW_TEST_COMMAND_WINDOWS: pytest {project}/tests
-          CIBW_TEST_SKIP: "*-macosx_*"
-          # Repair wheel command for macOS
-          CIBW_REPAIR_WHEEL_COMMAND_MACOS: >
-            delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel}
 
       - uses: actions/upload-artifact@v4
         with:
@@ -47,6 +37,7 @@ jobs:
 
   build_sdist:
     name: Build source distribution
+    # setup.py refuses to run on Linux, so build the sdist on a supported platform.
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -58,4 +49,3 @@ jobs:
         with:
           name: cibw-sdist
           path: dist/*.tar.gz
-
