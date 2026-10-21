@@ -14,12 +14,12 @@ A Python library for recording system audio on **macOS** and **Windows**.
 
 ### macOS
 - macOS 14.2 (Sonoma) or later
-- Python 3.9+
+- Python 3.11+
 - System audio recording permission (macOS will prompt on first use)
 
 ### Windows
 - Windows 10 or later
-- Python 3.9+
+- Python 3.11+
 - Visual Studio C++ build tools (for installation from source)
 
 ## Installation
@@ -33,7 +33,7 @@ pip install pysysaudio
 Pre-built wheels are available for:
 - **macOS**: 14.2+ - Intel, Apple Silicon, and Universal2
 - **Windows**: 10+ (64-bit)
-- **Python**: 3.9, 3.10, 3.11, 3.12, 3.13
+- **Python**: 3.11, 3.12, 3.13, 3.14, 3.15
 
 ### From Source
 

@@ -17,14 +17,14 @@ classifiers = [
     "Operating System :: MacOS :: MacOS X",
     "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
@@ -43,16 +43,16 @@ packages = ["pysysaudio"]
 
 [tool.black]
 line-length = 100
-target-version = ['py39']
+target-version = ['py311']
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 
 [tool.cibuildwheel]
-# Build for Python 3.9 through 3.13
-build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
+# Build for Python 3.11 through 3.15 (3.9 and 3.10 are past end of life)
+build = "cp311-* cp312-* cp313-* cp314-* cp315-*"
 # Skip 32-bit builds and all Linux builds (Linux not supported)
 skip = "*-win32 *-manylinux* *-musllinux_*"
 
